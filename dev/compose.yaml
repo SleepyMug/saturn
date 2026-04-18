@@ -10,15 +10,18 @@ services:
     stdin_open: true
     tty: true
     network_mode: host
+    userns_mode: "keep-id"
     environment:
       DEV_UID: "${DEV_UID}"
       DEV_GID: "${DEV_GID}"
       DEV_USER: guest
       DEV_PROJECT_NAME: "${DEV_PROJECT_NAME}"
       SATURN_LEVEL: "${SATURN_LEVEL}"
+      CONTAINER_HOST: unix:///run/podman/podman.sock
+      DOCKER_HOST: unix:///run/podman/podman.sock
     working_dir: /home/guest/${DEV_PROJECT_NAME}
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - ${XDG_RUNTIME_DIR}/podman/podman.sock:/run/podman/podman.sock
       # saturn-dual-mode start
       - ../:/home/guest/${DEV_PROJECT_NAME}
       - ~/.claude:/home/guest/.claude

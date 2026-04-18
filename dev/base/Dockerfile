@@ -7,12 +7,15 @@ RUN apt-get update \
         bash \
         ca-certificates \
         curl \
-        docker-cli \
-        docker-compose \
+        fuse-overlayfs \
         git \
         gosu \
+        podman \
+        podman-compose \
         python3 \
+        slirp4netns \
         sudo \
+        uidmap \
         xz-utils \
 	ripgrep \
 	emacs-nox

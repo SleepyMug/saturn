@@ -24,12 +24,14 @@ fi
 mkdir -p "$dev_home"/"${dev_proj_name}"
 chown -R "$dev_uid:$dev_gid" "$dev_home"
 
-if [ -S /var/run/docker.sock ]; then                            
-  sock_gid=$(stat -c '%g' /var/run/docker.sock)
-  if ! getent group "$sock_gid" >/dev/null 2>&1; then                                               
-    groupadd -g "$sock_gid" docker
+if [ -S /run/podman/podman.sock ]; then
+  sock_gid=$(stat -c '%g' /run/podman/podman.sock)
+  if [ "$sock_gid" != "$dev_gid" ]; then
+    if ! getent group "$sock_gid" >/dev/null 2>&1; then
+      groupadd -g "$sock_gid" podman
+    fi
+    usermod -aG "$(getent group "$sock_gid" | cut -d: -f1)" "$dev_user"
   fi
-  usermod -aG "$(getent group "$sock_gid" | cut -d: -f1)" "$dev_user"
 fi
 
 if [ -e /dev/kvm ]; then                            

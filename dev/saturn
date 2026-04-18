@@ -33,25 +33,17 @@ def fail(msg, code=1):
     raise SystemExit(code)
 
 
-def detect_compose():
-    docker = shutil.which("docker")
-    if docker is None:
-        fail("docker is required but was not found in PATH")
-    try:
-        subprocess.run(
-            [docker, "compose", "version"],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        return [docker, "compose"]
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
-    dc = shutil.which("docker-compose")
-    if dc is None:
-        fail("docker compose is required (install docker compose v2 or docker-compose)")
-    return [dc]
+def detect_runtime():
+    podman = shutil.which("podman")
+    if podman is None:
+        fail("podman is required but was not found in PATH")
+    pc = shutil.which("podman-compose")
+    if pc is None:
+        fail("podman-compose is required but was not found in PATH")
+    return podman, [pc]
 
 
-COMPOSE_CMD = detect_compose()
+RUNTIME, COMPOSE_CMD = detect_runtime()
 
 
 def current_level():
@@ -83,6 +75,7 @@ def runtime_env(base_tag):
     env["SATURN_LEVEL"] = str(current_level() + 1)
     env["COMPOSE_PROJECT_NAME"] = compose_project_name()
     env["SATURN_BASE_TAG"] = base_tag
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     return env
 
 
@@ -103,13 +96,13 @@ def ensure_base():
     need_build = True
     if cached == tag:
         r = subprocess.run(
-            ["docker", "image", "inspect", f"saturn-base:{tag}"],
+            [RUNTIME, "image", "inspect", f"saturn-base:{tag}"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         need_build = r.returncode != 0
     if need_build:
         subprocess.run(
-            ["docker", "build", "-t", f"saturn-base:{tag}", str(BASE_IMAGE_DIR)],
+            [RUNTIME, "build", "-t", f"saturn-base:{tag}", str(BASE_IMAGE_DIR)],
             check=True,
         )
         STATE_DIR.mkdir(exist_ok=True)
@@ -174,9 +167,19 @@ def compose_run(args, mode, base_tag, check=True, stdin_text=None):
 
 def container_id():
     r = subprocess.run(
-        ["docker", "ps", "-q",
-         "--filter", f"label=com.docker.compose.project={compose_project_name()}",
-         "--filter", f"label=com.docker.compose.service={SERVICE_NAME}"],
+        [RUNTIME, "ps", "-q",
+         "--filter", f"label=io.podman.compose.project={compose_project_name()}",
+         "--filter", f"label=io.podman.compose.service={SERVICE_NAME}"],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        return ""
+    ids = r.stdout.strip().splitlines()
+    if ids:
+        return ids[0]
+    r = subprocess.run(
+        [RUNTIME, "ps", "-q",
+         "--filter", f"name=^{compose_project_name()}[_-]{SERVICE_NAME}[_-]"],
         capture_output=True, text=True, check=False,
     )
     if r.returncode != 0:
@@ -216,10 +219,10 @@ def copy_in(entries):
             print(f"saturn: skipping copy-in (missing on host): {hp}", file=sys.stderr)
             continue
         parent = os.path.dirname(container.rstrip("/")) or "/"
-        subprocess.run(["docker", "exec", cid, "mkdir", "-p", parent], check=True)
-        subprocess.run(["docker", "cp", str(hp), f"{cid}:{container}"], check=True)
+        subprocess.run([RUNTIME, "exec", cid, "mkdir", "-p", parent], check=True)
+        subprocess.run([RUNTIME, "cp", str(hp), f"{cid}:{container}"], check=True)
         subprocess.run(
-            ["docker", "exec", cid, "chown", "-R",
+            [RUNTIME, "exec", cid, "chown", "-R",
              f"{os.getuid()}:{os.getgid()}", container],
             check=True,
         )
@@ -239,7 +242,7 @@ def copy_out(entries):
             else:
                 hp.unlink()
         r = subprocess.run(
-            ["docker", "cp", f"{cid}:{container}", str(hp)],
+            [RUNTIME, "cp", f"{cid}:{container}", str(hp)],
         )
         if r.returncode != 0:
             print(f"saturn: copy-out failed for {container}", file=sys.stderr)
@@ -276,14 +279,15 @@ def cmd_down(args):
 
 
 def docker_exec(cmd):
-    """Run inside the dev container as guest. Uses `docker exec` (not compose)
-    so stdin stays attached for tty — piping the compose YAML via stdin on
-    `docker compose exec` would fight the interactive terminal."""
+    """Run inside the dev container as guest. Uses `podman exec` directly
+    (not via compose) so stdin stays attached for tty — piping the compose
+    YAML via stdin on a compose-mediated exec would fight the interactive
+    terminal."""
     cid = container_id()
     if not cid:
         fail("container not running")
     subprocess.run(
-        ["docker", "exec", "-it",
+        [RUNTIME, "exec", "-it",
          "-u", CONTAINER_USER,
          "-e", f"HOME={CONTAINER_HOME}",
          cid, *cmd],
