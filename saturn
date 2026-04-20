@@ -82,6 +82,7 @@ RUN apt-get update \\
 """
 
 BASE_CONTAINERFILE_TAIL = """\
+USER 0
 COPY saturn /usr/local/bin/saturn
 RUN chmod 0755 /usr/local/bin/saturn
 
@@ -231,7 +232,13 @@ HOST_SOCK = os.environ.get("SATURN_HOST_SOCK", SOCK)
 USE_SUDO = os.environ.get("SATURN_SUDO", "0") == "1"
 
 os.environ["DOCKER_HOST"] = f"unix://{SOCK}"
-os.environ["DOCKER_BUILDKIT"] = "0"
+
+# Podman's docker-compat socket does not serve the BuildKit API, so any
+# `docker build` through it must use the classic builder. Docker itself
+# supports BuildKit (and prints a deprecation warning when the legacy
+# builder is forced), so only force-disable BuildKit when talking to podman.
+if ENGINE == "podman":
+    os.environ["DOCKER_BUILDKIT"] = "0"
 
 # Line-buffer stdout so saturn's own messages interleave correctly with the
 # unbuffered output from engine subprocesses (especially when piped).
@@ -497,8 +504,11 @@ def _interactive_flags() -> list[str]:
 
 
 def _project_env_flags(p: Project) -> list[str]:
+    # SATURN_ENGINE is propagated truthfully (not hardcoded "docker") so a
+    # nested saturn knows what kind of engine is actually behind the host
+    # socket — needed for e.g. the BuildKit-vs-classic-builder decision.
     return [
-        "-e", "SATURN_ENGINE=docker",
+        "-e", f"SATURN_ENGINE={ENGINE}",
         "-e", "SATURN_SOCK=/var/run/docker.sock",
         "-e", f"SATURN_HOST_SOCK={HOST_SOCK}",
         "-e", "SATURN_SUDO=1",
@@ -623,12 +633,16 @@ def cmd_up(args: argparse.Namespace) -> None:
     # the ws volume AND the host socket. The inner `docker build` shells
     # back out through the socket; the image lands in the host engine's store.
     print(f"building {p.image} from {p.vol_ws}...")
+    # Only disable BuildKit when the underlying host engine is podman — its
+    # docker-compat socket doesn't serve BuildKit. On rootless docker the
+    # socket does, and BuildKit is the supported path.
+    buildkit_env = ["-e", "DOCKER_BUILDKIT=0"] if ENGINE == "podman" else []
     r = subprocess.run(
         _engine_cmd(
             "run", "--rm", "--init",
             "-v", f"{p.vol_ws}:/ctx",
             "-v", f"{HOST_SOCK}:/var/run/docker.sock",
-            "-e", "DOCKER_BUILDKIT=0",
+            *buildkit_env,
             BASE_IMAGE,
             "sudo", "docker", "build",
             "-f", f"/ctx/{CONTAINERFILE_IN_VOL}",
