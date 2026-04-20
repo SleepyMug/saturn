@@ -1,0 +1,595 @@
+#!/usr/bin/env python3
+"""saturn: minimal per-project dev container CLI (rootless podman/docker).
+
+Zero host state. Projects are discovered by labels on their volumes; all
+per-project content (Containerfile, source, .git) lives inside
+`saturn_ws_<name>` and is committed with the project's own git.
+
+Works at any nesting level: env vars propagate so `saturn` inside a saturn
+container creates siblings on the host engine.
+
+Command groups:
+  project {ls,new,rm,shell}   host-side project lifecycle
+  runtime {info,init}         in-container ops on volume content
+
+Top-level:
+  base, up, down, shell, exec
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+# ---------- config from env ----------------------------------------------
+
+SCRIPT = Path(__file__).resolve()
+
+BASE_IMAGE = os.environ.get("SATURN_BASE_IMAGE", "localhost/saturn-base:latest")
+
+# The base image is built from this inlined Containerfile. `saturn base` writes
+# it to a temp dir alongside a copy of this very script (for `COPY saturn ...`)
+# so the distribution unit is a single file: `saturn` itself.
+#
+# To customize, point SATURN_BASE_CONTAINERFILE at your own file; it replaces
+# the text below but the build context (with saturn copied in) is the same, so
+# overrides MUST keep `COPY saturn /usr/local/bin/saturn` for nesting to work.
+BASE_CONTAINERFILE_TEXT = """\
+FROM docker.io/library/debian:trixie-slim
+
+RUN groupadd -g 10001 agent \\
+ && useradd  -u 10001 -g agent -m -s /bin/bash agent
+
+RUN apt-get update \\
+ && apt-get install -y --no-install-recommends \\
+      docker-cli sudo ca-certificates python3 \\
+ && rm -rf /var/lib/apt/lists/* \\
+ && echo 'agent ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/agent \\
+ && chmod 440 /etc/sudoers.d/agent
+
+COPY saturn /usr/local/bin/saturn
+RUN chmod 0755 /usr/local/bin/saturn
+
+WORKDIR /home/agent
+USER agent:agent
+
+CMD ["sleep", "infinity"]
+"""
+
+# SATURN_ENGINE names the host's rootless engine family — it no longer picks
+# the CLI binary (we always shell out to `docker`), only the default socket
+# path. All operations go through the socket → one service process serializes
+# store mutations, avoiding the rootless-podman corruption classes we hit.
+ENGINE = os.environ.get("SATURN_ENGINE", "podman")
+if ENGINE not in ("podman", "docker"):
+    sys.exit(f"SATURN_ENGINE must be podman or docker (got: {ENGINE})")
+
+
+def _default_socket() -> str:
+    xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    return f"{xdg}/podman/podman.sock" if ENGINE == "podman" else f"{xdg}/docker.sock"
+
+
+SOCK = os.environ.get("SATURN_SOCK", _default_socket())
+HOST_SOCK = os.environ.get("SATURN_HOST_SOCK", SOCK)
+USE_SUDO = os.environ.get("SATURN_SUDO", "0") == "1"
+
+os.environ["DOCKER_HOST"] = f"unix://{SOCK}"
+os.environ["DOCKER_BUILDKIT"] = "0"
+
+# Line-buffer stdout so saturn's own messages interleave correctly with the
+# unbuffered output from engine subprocesses (especially when piped).
+sys.stdout.reconfigure(line_buffering=True)
+
+
+# ---------- engine invocation helpers ------------------------------------
+
+def _engine_cmd(*args: str) -> list[str]:
+    prefix = ["sudo"] if USE_SUDO else []
+    return [*prefix, "docker", *args]
+
+
+def engine(*args: str) -> None:
+    subprocess.run(_engine_cmd(*args), check=True)
+
+
+def engine_quiet(*args: str) -> None:
+    subprocess.run(
+        _engine_cmd(*args),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True,
+    )
+
+
+def engine_ok(*args: str) -> bool:
+    r = subprocess.run(
+        _engine_cmd(*args),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return r.returncode == 0
+
+
+def engine_out(*args: str) -> str | None:
+    r = subprocess.run(
+        _engine_cmd(*args),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def engine_exec(*args: str) -> None:
+    cmd = _engine_cmd(*args)
+    os.execvp(cmd[0], cmd)
+
+
+# ---------- project model ------------------------------------------------
+
+CONTAINERFILE_IN_VOL = ".saturn/Containerfile"
+
+
+def ws_mount_for(name: str) -> str:
+    # Per-project workspace path so multiple projects nested on one host
+    # don't collide and the path itself reminds you where you are.
+    return f"/home/agent/{name}"
+
+CONTAINERFILE_TEMPLATE = (
+    "FROM {base}\n"
+    "\n"
+    "# Add project tooling here. Install as root, then drop back to agent.\n"
+    "# Example:\n"
+    "#   USER 0\n"
+    "#   RUN apt-get update \\\n"
+    "#    && apt-get install -y --no-install-recommends git ripgrep \\\n"
+    "#    && rm -rf /var/lib/apt/lists/*\n"
+    "#   USER agent:agent\n"
+)
+
+
+class Project:
+    def __init__(self, name: str) -> None:
+        if not name or "/" in name or name.startswith(".") or " " in name:
+            sys.exit(f"invalid project name: {name!r}")
+        self.name = name
+        self.container = f"saturn_{name}"
+        self.bootstrap_container = f"saturn_bootstrap_{name}"
+        self.image = f"localhost/saturn-{name}:latest"
+        self.vol_ws = f"saturn_ws_{name}"
+        self.ws_mount = ws_mount_for(name)
+
+
+def project_list() -> list[str]:
+    # Filter on the ws-marker label — one row per project, no dedupe needed.
+    out = engine_out(
+        "volume", "ls",
+        "--filter", "label=saturn.volume=ws",
+        "--format", "{{.Name}}",
+    )
+    if not out:
+        return []
+    names: list[str] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("saturn_ws_"):
+            names.append(line[len("saturn_ws_"):])
+    return sorted(names)
+
+
+def project_exists(name: str) -> bool:
+    return engine_ok("volume", "inspect", f"saturn_ws_{name}")
+
+
+# ---------- shared runtime helpers ---------------------------------------
+
+def _build_base() -> None:
+    """Build saturn-base from a temp context that always contains a copy of
+    this script (so `COPY saturn` works). SATURN_BASE_CONTAINERFILE, if set,
+    replaces the Containerfile text but reuses the same context."""
+    override = os.environ.get("SATURN_BASE_CONTAINERFILE")
+    with tempfile.TemporaryDirectory(prefix="saturn-base-") as td:
+        tdp = Path(td)
+        cf = tdp / "Containerfile"
+        if override:
+            op = Path(override)
+            if not op.is_file():
+                sys.exit(f"SATURN_BASE_CONTAINERFILE not found: {op}")
+            cf.write_text(op.read_text())
+        else:
+            cf.write_text(BASE_CONTAINERFILE_TEXT)
+        shutil.copy(SCRIPT, tdp / "saturn")
+        engine("build", "-f", str(cf), "-t", BASE_IMAGE, td)
+
+
+def ensure_base() -> None:
+    if engine_ok("image", "inspect", BASE_IMAGE):
+        return
+    print(f"building base image: {BASE_IMAGE} (first time only)")
+    _build_base()
+
+
+def check_socket() -> None:
+    if not Path(SOCK).is_socket():
+        sys.exit(f"engine socket not found at {SOCK}")
+
+
+def ensure_volume(vol_name: str, project: str, marker: str) -> None:
+    if engine_ok("volume", "inspect", vol_name):
+        return
+    engine_quiet(
+        "volume", "create",
+        "--label", f"saturn.project={project}",
+        "--label", f"saturn.volume={marker}",
+        vol_name,
+    )
+    engine_quiet(
+        "run", "--rm", "--init", "--user", "0",
+        "-v", f"{vol_name}:/mnt",
+        BASE_IMAGE,
+        "chown", "10001:10001", "/mnt",
+    )
+
+
+def container_status(name: str) -> str:
+    return engine_out("inspect", "-f", "{{.State.Status}}", name) or ""
+
+
+def _interactive_flags() -> list[str]:
+    # docker CLI rejects -t when stdin isn't a TTY; podman was forgiving.
+    return ["-it"] if sys.stdin.isatty() else ["-i"]
+
+
+def _project_env_flags(p: Project) -> list[str]:
+    return [
+        "-e", "SATURN_ENGINE=docker",
+        "-e", "SATURN_SOCK=/var/run/docker.sock",
+        "-e", f"SATURN_HOST_SOCK={HOST_SOCK}",
+        "-e", "SATURN_SUDO=1",
+        "-e", f"SATURN_PROJECT={p.name}",
+    ]
+
+
+# ---------- commands: base ----------------------------------------------
+
+def cmd_base(_args: argparse.Namespace) -> None:
+    engine_ok("rmi", BASE_IMAGE)
+    print(f"building base image: {BASE_IMAGE}")
+    _build_base()
+    print(f"base ready: {BASE_IMAGE}")
+
+
+# ---------- commands: project group -------------------------------------
+
+def cmd_project_ls(_args: argparse.Namespace) -> None:
+    for n in project_list():
+        print(n)
+
+
+def cmd_project_new(args: argparse.Namespace) -> None:
+    p = Project(args.name)
+    check_socket()
+    ensure_base()
+    ensure_volume(p.vol_ws, p.name, "ws")
+    print(f"created: {p.vol_ws}")
+    print(f"  next: saturn project shell {p.name}"
+          "   # clone a repo into ws, or run `saturn runtime init`")
+
+
+def cmd_project_rm(args: argparse.Namespace) -> None:
+    p = Project(args.name)
+    if not project_exists(p.name):
+        sys.exit(f"no such project: {p.name}")
+    prompt = (
+        f"remove container {p.container}, volume {p.vol_ws}, "
+        f"and image {p.image}?\n"
+        f"type project name ({p.name}) to confirm: "
+    )
+    try:
+        ans = input(prompt)
+    except EOFError:
+        ans = ""
+    if ans != p.name:
+        sys.exit("aborted")
+    engine_ok("rm", "-f", p.container)
+    engine_ok("rm", "-f", p.bootstrap_container)
+    engine_ok("volume", "rm", p.vol_ws)
+    engine_ok("rmi", p.image)
+    print(f"removed: {p.name}")
+
+
+def cmd_project_shell(args: argparse.Namespace) -> None:
+    p = Project(args.name)
+    if not project_exists(p.name):
+        sys.exit(f"no such project: {p.name}"
+                 f"  (try: saturn project new {p.name})")
+    check_socket()
+    ensure_base()
+    engine_ok("rm", "-f", p.bootstrap_container)
+    engine_exec(
+        "run", "--rm", *_interactive_flags(), "--init",
+        "--name", p.bootstrap_container,
+        "-v", f"{p.vol_ws}:{p.ws_mount}",
+        "-v", f"{HOST_SOCK}:/var/run/docker.sock",
+        *_project_env_flags(p),
+        "-w", p.ws_mount,
+        BASE_IMAGE,
+        "/bin/bash",
+    )
+
+
+# ---------- commands: up/down/shell/exec --------------------------------
+
+def cmd_up(args: argparse.Namespace) -> None:
+    p = Project(args.name)
+    if not project_exists(p.name):
+        sys.exit(f"no such project: {p.name}"
+                 f"  (try: saturn project new {p.name})")
+    check_socket()
+    ensure_base()
+
+    # Build the project image from a transient base container that mounts
+    # the ws volume AND the host socket. The inner `docker build` shells
+    # back out through the socket; the image lands in the host engine's store.
+    print(f"building {p.image} from {p.vol_ws}...")
+    r = subprocess.run(
+        _engine_cmd(
+            "run", "--rm", "--init",
+            "-v", f"{p.vol_ws}:/ctx",
+            "-v", f"{HOST_SOCK}:/var/run/docker.sock",
+            "-e", "DOCKER_BUILDKIT=0",
+            BASE_IMAGE,
+            "sudo", "docker", "build",
+            "-f", f"/ctx/{CONTAINERFILE_IN_VOL}",
+            "-t", p.image,
+            "/ctx",
+        )
+    )
+    if r.returncode != 0:
+        sys.exit(
+            f"build failed. is {CONTAINERFILE_IN_VOL} present in {p.vol_ws}?\n"
+            f"  try: saturn project shell {p.name}"
+            "   # then `saturn runtime init` or clone a repo"
+        )
+
+    status = container_status(p.container)
+    if status == "running":
+        print(f"already up: {p.container}"
+              "  (down && up to pick up image changes)")
+        return
+    if status:
+        engine_ok("rm", "-f", p.container)
+    engine_quiet(
+        "run", "-d", "--init", "--name", p.container,
+        "-v", f"{p.vol_ws}:{p.ws_mount}",
+        "-v", f"{HOST_SOCK}:/var/run/docker.sock",
+        "-w", p.ws_mount,
+        *_project_env_flags(p),
+        p.image,
+    )
+    print(f"up: {p.container}")
+
+
+def cmd_down(args: argparse.Namespace) -> None:
+    p = Project(args.name)
+    engine_ok("rm", "-f", p.container)
+    print(f"down: {p.container} (volumes kept)")
+
+
+# ---------- commands: put/get -------------------------------------------
+
+def _validate_vol_rel(path: str, role: str) -> None:
+    if path.startswith("/"):
+        sys.exit(f"{role} must be a relative path inside the project root: {path!r}")
+    if ".." in Path(path).parts:
+        sys.exit(f"{role} must not contain '..': {path!r}")
+
+
+def _with_cp_helper(p: Project, fn) -> None:
+    """Spin a transient base container with ws mounted; invoke fn(container)."""
+    tmp = f"saturn_cp_{p.name}"
+    engine_ok("rm", "-f", tmp)
+    engine_quiet(
+        "run", "-d", "--init", "--name", tmp,
+        "-v", f"{p.vol_ws}:{p.ws_mount}",
+        BASE_IMAGE, "sleep", "infinity",
+    )
+    try:
+        fn(tmp)
+    finally:
+        engine_ok("rm", "-f", tmp)
+
+
+def cmd_put(args: argparse.Namespace) -> None:
+    p = Project(args.name)
+    if not project_exists(p.name):
+        sys.exit(f"no such project: {p.name}")
+    check_socket()
+    ensure_base()
+    # Preserve the raw src string so trailing `/.` survives (Path normalizes it
+    # away). docker cp treats `src/. dst/` as "copy contents of src into dst",
+    # which is exactly what an import-existing-dir workflow needs.
+    src_raw = args.src
+    if not Path(src_raw).exists():
+        sys.exit(f"source not found: {src_raw}")
+    dst = args.dst or Path(src_raw).name or "."
+    _validate_vol_rel(dst, "dst")
+
+    def do(tmp: str) -> None:
+        parent = f"{p.ws_mount}/{Path(dst).parent}"
+        engine_quiet("exec", "--user", "0", tmp, "mkdir", "-p", parent)
+        engine("cp", src_raw, f"{tmp}:{p.ws_mount}/{dst}")
+        # Fix storage-level ownership so `agent` owns the new content.
+        # Chown the whole ws to catch any new intermediate parent dirs — safe
+        # since saturn is the only writer.
+        engine_quiet(
+            "exec", "--user", "0", tmp,
+            "chown", "-R", "10001:10001", p.ws_mount,
+        )
+
+    _with_cp_helper(p, do)
+    print(f"put: {src_raw} -> {p.name}:{dst}")
+
+
+def cmd_get(args: argparse.Namespace) -> None:
+    p = Project(args.name)
+    if not project_exists(p.name):
+        sys.exit(f"no such project: {p.name}")
+    check_socket()
+    ensure_base()
+    _validate_vol_rel(args.src, "src")
+    dst = args.dst or "."
+
+    def do(tmp: str) -> None:
+        engine("cp", f"{tmp}:{p.ws_mount}/{args.src}", dst)
+
+    _with_cp_helper(p, do)
+    print(f"get: {p.name}:{args.src} -> {dst}")
+
+
+def cmd_shell(args: argparse.Namespace) -> None:
+    p = Project(args.name)
+    if container_status(p.container) != "running":
+        sys.exit(f"container not running: {p.container}"
+                 f"  (try: saturn up {p.name})")
+    engine_exec("exec", *_interactive_flags(), p.container, "/bin/bash")
+
+
+def cmd_exec(args: argparse.Namespace) -> None:
+    p = Project(args.name)
+    if container_status(p.container) != "running":
+        sys.exit(f"container not running: {p.container}"
+                 f"  (try: saturn up {p.name})")
+    engine_exec("exec", *_interactive_flags(), p.container, *args.cmd)
+
+
+# ---------- commands: runtime group -------------------------------------
+
+def _runtime_project_name() -> str:
+    name = os.environ.get("SATURN_PROJECT")
+    if not name:
+        sys.exit("SATURN_PROJECT not set"
+                 " (runtime commands only work inside a saturn container)")
+    return name
+
+
+def cmd_runtime_info(_args: argparse.Namespace) -> None:
+    name = _runtime_project_name()
+    ws = ws_mount_for(name)
+    cf = Path(ws) / CONTAINERFILE_IN_VOL
+    print(f"project:       {name}")
+    print(f"ws mount:      {ws}")
+    print(f"Containerfile: {cf} {'(exists)' if cf.is_file() else '(MISSING)'}")
+
+
+def cmd_runtime_init(_args: argparse.Namespace) -> None:
+    name = _runtime_project_name()
+    cf = Path(ws_mount_for(name)) / CONTAINERFILE_IN_VOL
+    if cf.exists():
+        sys.exit(f"refusing to overwrite: {cf}")
+    cf.parent.mkdir(parents=True, exist_ok=True)
+    cf.write_text(CONTAINERFILE_TEMPLATE.format(base=BASE_IMAGE))
+    print(f"seeded: {cf}")
+
+
+# ---------- dispatch ----------------------------------------------------
+
+def main() -> None:
+    # Intercept `exec` before argparse so flags in the user's command survive.
+    if len(sys.argv) >= 2 and sys.argv[1] == "exec":
+        if len(sys.argv) < 4:
+            sys.exit("usage: saturn exec <name> <cmd> [args...]")
+        ns = argparse.Namespace(name=sys.argv[2], cmd=sys.argv[3:])
+        cmd_exec(ns)
+        return
+
+    parser = argparse.ArgumentParser(
+        prog="saturn",
+        description="minimal per-project dev container CLI (rootless podman/docker)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "env vars:\n"
+            "  SATURN_ENGINE       podman|docker -- host engine family (default podman)\n"
+            "  SATURN_SOCK         socket path (DOCKER_HOST is derived from this)\n"
+            "  SATURN_HOST_SOCK    host path to bind-mount into new containers\n"
+            "  SATURN_SUDO         '1' to prefix sudo (auto-set inside)\n"
+            "  SATURN_PROJECT      (inside only) project name; used by runtime cmds\n"
+            "  SATURN_BASE_IMAGE   default: localhost/saturn-base:latest\n"
+            "  SATURN_BASE_CONTAINERFILE  optional override file (must COPY saturn\n"
+            "                             /usr/local/bin/saturn); default is inlined\n"
+        ),
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("base", help="(re)build the base image").set_defaults(fn=cmd_base)
+
+    p_up = sub.add_parser("up", help="build project image + start container")
+    p_up.add_argument("name")
+    p_up.set_defaults(fn=cmd_up)
+
+    p_down = sub.add_parser("down", help="stop+remove container (volumes kept)")
+    p_down.add_argument("name")
+    p_down.set_defaults(fn=cmd_down)
+
+    p_shell = sub.add_parser("shell", help="interactive shell in project container")
+    p_shell.add_argument("name")
+    p_shell.set_defaults(fn=cmd_shell)
+
+    p_exec = sub.add_parser("exec", help="run command in project container")
+    p_exec.add_argument("name")
+    p_exec.add_argument("cmd", nargs=argparse.REMAINDER)
+    p_exec.set_defaults(fn=cmd_exec)
+
+    p_put = sub.add_parser("put", help="copy host file/dir into the project volume")
+    p_put.add_argument("name")
+    p_put.add_argument("src", help="host path (file or directory)")
+    p_put.add_argument("dst", nargs="?", default=None,
+                       help="destination path inside the project (default: basename of src)")
+    p_put.set_defaults(fn=cmd_put)
+
+    p_get = sub.add_parser("get", help="copy file/dir out of the project volume")
+    p_get.add_argument("name")
+    p_get.add_argument("src", help="source path inside the project")
+    p_get.add_argument("dst", nargs="?", default=None,
+                       help="host destination (default: current dir)")
+    p_get.set_defaults(fn=cmd_get)
+
+    proj = sub.add_parser("project", help="project lifecycle")
+    proj_sub = proj.add_subparsers(dest="subcommand")
+    proj_sub.add_parser("ls", help="list projects").set_defaults(fn=cmd_project_ls)
+    pn = proj_sub.add_parser("new", help="create labelled volumes (no file writes)")
+    pn.add_argument("name")
+    pn.set_defaults(fn=cmd_project_new)
+    pr = proj_sub.add_parser("rm", help="remove container, volumes, image")
+    pr.add_argument("name")
+    pr.set_defaults(fn=cmd_project_rm)
+    ps = proj_sub.add_parser("shell", help="base-image shell with project volumes mounted")
+    ps.add_argument("name")
+    ps.set_defaults(fn=cmd_project_shell)
+
+    rt = sub.add_parser("runtime", help="in-container ops on volume content")
+    rt_sub = rt.add_subparsers(dest="subcommand")
+    rt_sub.add_parser("info", help="show project info").set_defaults(fn=cmd_runtime_info)
+    rt_sub.add_parser("init", help="seed .saturn/Containerfile template").set_defaults(fn=cmd_runtime_init)
+
+    args = parser.parse_args()
+    fn = getattr(args, "fn", None)
+    if fn is None:
+        parser.print_help()
+        return
+    fn(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.CalledProcessError as e:
+        sys.exit(e.returncode)
+    except KeyboardInterrupt:
+        sys.exit(130)
