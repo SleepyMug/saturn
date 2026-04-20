@@ -15,7 +15,6 @@ Vars the user may set to customize host-side saturn:
 - `SATURN_ENGINE=podman|docker` — host engine family (default `podman`). Only picks the default socket path; saturn always shells to `docker`.
 - `SATURN_SOCK=<path>` — explicit socket path override.
 - `SATURN_BASE_IMAGE=<ref>` — override base image tag.
-- `SATURN_BASE_CONTAINERFILE=<path>` — override base Containerfile source; must still `COPY saturn /usr/local/bin/saturn`.
 
 Vars the user must NOT set on the host:
 

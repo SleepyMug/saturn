@@ -6,6 +6,8 @@
 
 A "project" in saturn is a tuple of engine-managed resources whose names are mechanically derived from one string. There is no project file, no config registry, no `.saturn/` directory on the host — `project_list()` interrogates the engine's volume index directly.
 
+Per-project volumes carry labels `saturn.project=<name>` + `saturn.volume=ws`. Orthogonal to projects, user-global **mixin** volumes ([mixins](../mixins/index.md)) carry `saturn.volume=mixin` + `saturn.mixin=<mixin-name>` and are never touched by project lifecycle commands — they survive across all `project rm` operations.
+
 ## Provided APIs
 
 ### `class Project(name: str)`

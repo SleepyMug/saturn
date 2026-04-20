@@ -11,28 +11,29 @@ saturn is a thin orchestrator over `docker` CLI. It owns no state of its own: ev
 ```
 ┌──────────────────────────── cli ────────────────────────────┐
 │ argparse tree + main() + exec-argv intercept                │
-└─────────┬────────────┬────────────┬─────────────────────────┘
-          │            │            │
-          ▼            ▼            ▼
-     ┌─────────┐  ┌─────────┐  ┌────────────┐
-     │ project │  │   base  │  │  runtime   │
-     │  model  │  │  image  │  │  helpers   │
-     └────┬────┘  └────┬────┘  └─────┬──────┘
-          │            │             │
-          └────────────┴─────┬───────┘
-                             ▼
-                     ┌───────────────┐
-                     │  engine ops   │
-                     │ (subprocess)  │
-                     └───────────────┘
-                             │
-                             ▼
-                 DOCKER_HOST → host engine socket
+└───────┬──────────┬──────────┬──────────┬────────────────────┘
+        │          │          │          │
+        ▼          ▼          ▼          ▼
+   ┌─────────┐ ┌─────────┐ ┌────────┐ ┌────────────┐
+   │ project │ │   base  │ │ mixins │ │  runtime   │
+   │  model  │ │  image  │ │        │ │  helpers   │
+   └────┬────┘ └────┬────┘ └────┬───┘ └─────┬──────┘
+        │           │           │           │
+        └───────────┴─────┬─────┴───────────┘
+                          ▼
+                  ┌───────────────┐
+                  │  engine ops   │
+                  │ (subprocess)  │
+                  └───────────────┘
+                          │
+                          ▼
+              DOCKER_HOST → host engine socket
 ```
 
 - **cli** ([components/cli](components/cli/index.md)) — argparse subparser tree and a `sys.argv` intercept so `saturn exec <name> <cmd...>` doesn't have its flags consumed by argparse.
 - **project model** ([components/project](components/project/index.md)) — the `Project` class derives all resource names (`saturn_<name>`, `saturn_ws_<name>`, `localhost/saturn-<name>:latest`, `/home/agent/<name>`) from a single `<name>` input. `project_list()` queries the engine for volumes labelled `saturn.volume=ws`.
-- **base image** ([components/base-image](components/base-image/index.md)) — the saturn-base image is built from an inlined Containerfile string; at build time, a temp dir is assembled containing the Containerfile + a copy of the running saturn script (for the `COPY saturn` step).
+- **base image** ([components/base-image](components/base-image/index.md)) — the saturn-base image is built from an inlined Containerfile string (split into HEAD + TAIL, with mixin install lines spliced between); at build time, a temp dir is assembled containing the rendered Containerfile + a copy of the running saturn script (for the `COPY saturn` step).
+- **mixins** ([components/mixins](components/mixins/index.md)) — inlined registry of user-global state bundles (install snippet + user-global volume + target path). Used by `base template`/`default` (splice install lines), `up` (mount volumes in project container), and `project config` (shell with only mixin volumes).
 - **runtime helpers** — `ensure_base()`, `check_socket()`, `ensure_volume()`, `container_status()`, plus env-propagation helpers for launching new containers.
 - **engine ops** ([components/engine](components/engine/index.md)) — all engine calls go through `_engine_cmd(*args)` which prepends `["sudo"]` if `SATURN_SUDO=1` is set, then always `["docker", *args]`. saturn never shells to `podman` directly; the docker CLI speaks both daemons' docker-compat API.
 
@@ -45,6 +46,14 @@ saturn is a thin orchestrator over `docker` CLI. It owns no state of its own: ev
 3. Build project image from volume: `docker run --rm --init -v saturn_ws_<name>:/ctx -v $HOST_SOCK:/var/run/docker.sock saturn-base sudo docker build -f /ctx/.saturn/Containerfile -t localhost/saturn-<name>:latest /ctx` — a transient helper runs `docker build` *from inside*, so the build context is volume contents and the image lands in the host engine's store.
 4. `docker run -d --init --name saturn_<name> -v saturn_ws_<name>:/home/agent/<name> -v $HOST_SOCK:/var/run/docker.sock -w /home/agent/<name> -e SATURN_*=... saturn-<name>:latest`.
 
+### `saturn up <name> --mixins <csv>` — with user-state volumes
+
+Additionally mount one volume per selected mixin at its target path. Engine-level effect: the `docker run -d ...` call includes a `-v saturn_mixin_<m>:<target>` or `--mount type=volume,source=saturn_mixin_<m>,target=<target>,volume-subpath=<subpath>` flag per mixin (see [components/mixins](components/mixins/index.md)). The mixin volumes are created on-demand (chowned to agent, subpath files pre-touched) the first time they're selected by any command.
+
+### `saturn project config [--mixins <csv>]` — interactive state setup
+
+Base-image shell with only the selected mixin volumes (plus the engine socket) mounted — no ws volume, no `SATURN_PROJECT`. Users run `ssh-keygen`, `gh auth login`, etc. to populate the user-global state. Defaults to all mixins when `--mixins` is omitted.
+
 ### `saturn exec <name> <cmd...>` — in the project container
 
 1. Verify container is running (`container_status`).
@@ -53,10 +62,13 @@ saturn is a thin orchestrator over `docker` CLI. It owns no state of its own: ev
 ### `saturn put <name> <host-src> [<dst>]` — import files
 
 1. Spin a transient helper: `docker run -d --init --name saturn_cp_<name> -v saturn_ws_<name>:/home/agent/<name> saturn-base sleep infinity`.
-2. `docker exec --user 0 saturn_cp_<name> mkdir -p <parent>`.
-3. `docker cp <host-src> saturn_cp_<name>:/home/agent/<name>/<dst>` — raw src string, so trailing `/.` semantics survive.
-4. `docker exec --user 0 saturn_cp_<name> chown -R 10001:10001 /home/agent/<name>` — fixes storage-level ownership so `agent` owns the new content.
-5. `docker rm -f saturn_cp_<name>`.
+2. Resolve `<dst>`: absolute paths pass through; relative paths are rooted at `/home/agent/<name>/`.
+3. `docker exec --user 0 saturn_cp_<name> mkdir -p <parent>`.
+4. `docker cp <host-src> saturn_cp_<name>:<resolved-dst>` — raw src string, so trailing `/.` semantics survive.
+5. `docker exec --user 0 saturn_cp_<name> chown -R 10001:10001 /home/agent/<name>` — fixes storage-level ownership so `agent` owns the new content.
+6. `docker rm -f saturn_cp_<name>`.
+
+`get` is the reverse and applies the same resolution to `<src>`: absolute paths are used as-is inside the helper, relative paths are rooted at the ws mount.
 
 ### Nesting
 

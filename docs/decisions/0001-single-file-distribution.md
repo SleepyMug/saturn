@@ -1,6 +1,6 @@
 # 0001 — Single-file distribution with inlined Containerfile
 
-> Saturn ships as one Python script. The saturn-base Containerfile is inlined; `saturn base` assembles a temp build context containing both the Containerfile and a copy of saturn itself.
+> Saturn ships as one Python script. The saturn-base Containerfile is inlined; `saturn base default` assembles a temp build context containing both the Containerfile and a copy of saturn itself.
 
 ## Context
 
@@ -8,9 +8,9 @@ Early iterations had two on-disk files — a `saturn` script and an adjacent `Co
 
 ## Decision
 
-Inline the Containerfile into saturn as `BASE_CONTAINERFILE_TEXT`. On `saturn base` (or `ensure_base()` on first use), create a `tempfile.TemporaryDirectory`, write the Containerfile text into it, `shutil.copy` the running saturn script alongside it as `saturn`, then `docker build -f <tmp>/Containerfile -t saturn-base <tmp>`. The `COPY saturn /usr/local/bin/saturn` step in the Containerfile works because the build context contains saturn.
+Inline the Containerfile into saturn as `BASE_CONTAINERFILE_TEXT`. On `saturn base default` (or `ensure_base()` on first use), create a `tempfile.TemporaryDirectory`, write the Containerfile text into it, `shutil.copy` the running saturn script alongside it as `saturn`, then `docker build -f <tmp>/Containerfile -t saturn-base <tmp>`. The `COPY saturn /usr/local/bin/saturn` step in the Containerfile works because the build context contains saturn.
 
-`SATURN_BASE_CONTAINERFILE` is preserved as an override for bespoke base images; overrides must keep `COPY saturn /usr/local/bin/saturn` because saturn still gets copied into the build context alongside the overridden file.
+Customization is an explicit CLI path, not an env var: `saturn base template > my.Containerfile` prints the inlined default, and `saturn base build my.Containerfile` rebuilds from a user-supplied file. Custom Containerfiles must keep `COPY saturn /usr/local/bin/saturn` because saturn still gets copied into the build context alongside the user's file.
 
 ## Consequences
 
@@ -22,5 +22,5 @@ Inline the Containerfile into saturn as `BASE_CONTAINERFILE_TEXT`. On `saturn ba
 
 ## Rejected alternatives
 
-- **Publish saturn-base to a registry** — simplifies `saturn base` to `docker pull`, but adds CI/versioning ops. Reconsider if saturn grows external users.
+- **Publish saturn-base to a registry** — simplifies `saturn base default` to `docker pull`, but adds CI/versioning ops. Reconsider if saturn grows external users.
 - **zipapp bundle** — overkill for a single Python script + a small Containerfile.

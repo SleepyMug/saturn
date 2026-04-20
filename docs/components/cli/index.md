@@ -19,17 +19,26 @@ Entry point when the script is invoked directly.
 
 ### Command surface
 
+`--mixins` flags on mixin-aware commands share the same resolution rule ([`_cli_mixins`](../mixins/index.md#provided-apis)): omitted → `DEFAULT_MIXINS` (`ssh,claude,claude-json,codex,gh`); explicit `''` → no mixins; any other comma-separated value → that exact list.
+
 Top-level:
 
 | Command | Handler | Semantics |
 |---|---|---|
-| `base` | `cmd_base` | Force-rebuild saturn-base (`docker rmi` then `_build_base()`). |
-| `up <name>` | `cmd_up` | Build project image from volume, then create+run the project container. No-op if already running. |
+| `up <name> [--mixins <csv>]` | `cmd_up` | Build project image from volume, then create+run the project container. `--mixins` mounts the selected user-global mixin volumes at their targets (defaults to `DEFAULT_MIXINS`). No-op if already running. |
 | `down <name>` | `cmd_down` | `docker rm -f saturn_<name>`. Idempotent. Volumes kept. |
 | `shell <name>` | `cmd_shell` | `exec -it saturn_<name> /bin/bash`; errors if container isn't running. |
 | `exec <name> <cmd...>` | `cmd_exec` | `exec -it saturn_<name> <cmd...>`; errors if container isn't running. |
 | `put <name> <src> [<dst>]` | `cmd_put` | Copy host path into the project volume; see [../put-get](../../architecture.md#saturn-put-name-host-src-dst--import-files). |
 | `get <name> <src> [<dst>]` | `cmd_get` | Copy volume path out to host. |
+
+`base` group (saturn-base image lifecycle):
+
+| Command | Handler | Semantics |
+|---|---|---|
+| `base template [--mixins <csv>]` | `cmd_base_template` | Write the rendered Containerfile to stdout. Splices mixin install lines (defaults to `DEFAULT_MIXINS`). |
+| `base default [--mixins <csv>]` | `cmd_base_default` | Force-rebuild saturn-base (`docker rmi` then `_build_base(_render_base_containerfile(mixins))`). Defaults to `DEFAULT_MIXINS`. |
+| `base build <file>` | `cmd_base_build` | Force-rebuild saturn-base from a user-supplied Containerfile (errors if the file is missing). **No `--mixins`** — user file is verbatim. |
 
 `project` group (host-side lifecycle):
 
@@ -37,8 +46,9 @@ Top-level:
 |---|---|---|
 | `project ls` | `cmd_project_ls` | List projects via label filter on `saturn.volume=ws`. |
 | `project new <name>` | `cmd_project_new` | Create labelled ws volume, chown to agent. No file writes. |
-| `project rm <name>` | `cmd_project_rm` | Remove container, volume, and project image. Requires typing project name to confirm. |
+| `project rm <name>` | `cmd_project_rm` | Remove container, volume, and project image. Requires typing project name to confirm. Never touches mixin volumes. |
 | `project shell <name>` | `cmd_project_shell` | Base-image shell with the project's ws volume mounted, for bootstrap (clone, scaffold) before any project image exists. |
+| `project config [--mixins <csv>]` | `cmd_project_config` | Base-image shell with **only** mixin volumes mounted (no ws volume, no `SATURN_PROJECT`). For interactive setup of user-global state. Defaults to `DEFAULT_MIXINS`. |
 
 `runtime` group (in-container; requires `SATURN_PROJECT` env):
 
@@ -52,6 +62,7 @@ Top-level:
 - [`Project(name)`](../project/index.md#provided-apis) — construct resource-name bundle from a single name.
 - [`project_list()`, `project_exists(name)`](../project/index.md#provided-apis) — label-based discovery.
 - [`ensure_base()`, `_build_base()`](../base-image/index.md#provided-apis) — saturn-base availability.
+- [mixin helpers (`MIXINS`, `_parse_mixin_list`, `_mixin_mount_args`, `_render_base_containerfile`)](../mixins/index.md#provided-apis) — argument parsing and mount/render computation for the `--mixins` flag and `project config`.
 - [engine wrappers (`engine`, `engine_ok`, `engine_quiet`, `engine_out`, `engine_exec`)](../engine/index.md#provided-apis) — subprocess to docker CLI.
 - [runtime helpers (`check_socket`, `ensure_volume`, `container_status`, `_interactive_flags`, `_project_env_flags`)](../engine/index.md#provided-apis).
 

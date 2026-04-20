@@ -2,23 +2,31 @@
 
 Minimal per-project dev-container CLI for rootless podman and rootless Docker. A saturn container runs as a non-root user (`agent`, uid 10001), has the docker CLI wired up to the host engine's socket, and keeps your source in a named volume so your host filesystem stays clean. Works at any nesting level — running `saturn` inside a saturn container creates siblings on the host engine.
 
-**Zero host state.** Projects are discovered by labels on their volumes; all per-project content (Containerfile, source, `.git/`) lives inside `saturn_ws_<name>` and is committed with the project's own git. Per-project customization (extra mounts, env vars, etc.) will come later, driven by `.saturn/` content inside the volume.
+**Zero host state.** Projects are discovered by labels on their volumes; all per-project content (Containerfile, source, `.git/`) lives inside `saturn_ws_<name>` and is committed with the project's own git. User-global state (SSH keys, `gh`/Claude/Codex auth, editor config) is expressed via **mixins** — see *Mixins* below.
 
 ## Install
 
-Single file. The `saturn-base` Containerfile is inlined in the script; `saturn base` assembles a temp build context with the inlined recipe plus a copy of saturn itself (for `COPY saturn /usr/local/bin/saturn`, so nesting works).
+Single file. The `saturn-base` Containerfile is inlined in the script; `saturn base default` assembles a temp build context with the inlined recipe plus a copy of saturn itself (for `COPY saturn /usr/local/bin/saturn`, so nesting works).
 
 ```sh
 curl -fsSL <url>/saturn -o ~/.local/bin/saturn && chmod +x ~/.local/bin/saturn
-saturn base
+saturn base default
 ```
 
-Custom base image: set `SATURN_BASE_CONTAINERFILE=/path/to/your/Containerfile`. Your override must keep `COPY saturn /usr/local/bin/saturn` — saturn copies itself into the build context alongside your file.
+Custom base image:
+
+```sh
+saturn base template > my.Containerfile    # print the inlined default
+$EDITOR my.Containerfile                    # tweak it — keep `COPY saturn /usr/local/bin/saturn`
+saturn base build my.Containerfile          # rebuild localhost/saturn-base from your file
+```
+
+Your override must keep `COPY saturn /usr/local/bin/saturn` — saturn copies itself into the build context alongside your file so nesting continues to work.
 
 ## Quick start
 
 ```sh
-./saturn base                              # one-time: build saturn-base
+./saturn base default                      # one-time: build saturn-base
 
 # Option A — scaffold a fresh project
 saturn project new myproj                  # creates labelled ws volume
@@ -56,6 +64,41 @@ saturn get myproj <src> [<host-dst>]       # project -> host (default host-dst =
 ```
 
 Inside the container, `saturn runtime info` shows project + paths; the same `saturn` binary also works nested (creates siblings on the host engine via the propagated socket).
+
+## Mixins
+
+Mixins carry user-global state (SSH keys, `gh` tokens, Claude/Codex auth, editor config) into project containers without bind-mounting host directories. Each mixin bundles:
+
+- an optional install snippet spliced into the base Containerfile (`RUN <cmd>`),
+- a user-global named volume (`saturn_mixin_<name>`, labeled `saturn.volume=mixin`),
+- a target path inside the container where the volume is mounted (with `volume-subpath=` for file targets like `~/.claude.json`).
+
+Built-in mixins: `ssh`, `gh`, `claude`, `claude-json`, `codex`, `emacs`, `xdg-config`.
+
+The default set, used whenever `--mixins` is omitted, is `ssh,claude,claude-json,codex,gh` — so a bare `saturn up myproj` mounts all of these (and the first-use base-image build installs their tools). Pass `--mixins ''` to opt out, or `--mixins <csv>` to pick a different set.
+
+```sh
+# 1. Install the tools into saturn-base (run once, or whenever you change the list):
+saturn base default                          # uses defaults: ssh,claude,claude-json,codex,gh
+saturn base default --mixins ssh,gh,claude,claude-json   # pick a different set
+
+# 2. Populate the user-global state interactively — shell has ONLY mixin volumes mounted:
+saturn project config                        # defaults: ssh,claude,claude-json,codex,gh mounted
+saturn project config --mixins ssh           # just ssh — then: ssh-keygen -t ed25519
+saturn project config --mixins gh            # just gh — then: gh auth login
+saturn project config --mixins claude-json,emacs,xdg-config  # the non-default ones
+
+# 3. Mount the state into a project container:
+saturn up myproj                             # defaults: ssh,claude,claude-json,codex,gh
+saturn up myproj --mixins ssh,gh,claude,claude-json,emacs    # custom set
+saturn up myproj --mixins ''                 # opt out of all mixins
+```
+
+Mixin volumes live outside project lifecycle — `saturn project rm` never touches them. To edit the mixin registry (add a tool, change a command or target), edit `MIXINS` in the `saturn` script itself.
+
+`saturn base build <file>` does not accept `--mixins` (user files are used verbatim). Combine a custom base with mixins via: `saturn base template --mixins ... > my.Containerfile`, edit, `saturn base build my.Containerfile`.
+
+Engine requirement: `volume-subpath=` (used for file-target mixins like `claude-json`) needs Docker 25.0+ or Podman 4.7+.
 
 ## Avoiding podman storage races
 

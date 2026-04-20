@@ -9,11 +9,34 @@ Works at any nesting level: env vars propagate so `saturn` inside a saturn
 container creates siblings on the host engine.
 
 Command groups:
-  project {ls,new,rm,shell}   host-side project lifecycle
+  base {template,default,build}  base-image lifecycle
+    template                      print default Containerfile to stdout
+    default                       (re)build base from inlined default
+    build <file>                  (re)build base from a Containerfile
+  project {ls,new,rm,shell,config}   host-side project lifecycle
+    ls                            list projects
+    new <name>                    create labelled ws volume (no file writes)
+    rm <name>                     remove container, volumes, image
+    shell <name>                  base-image shell with project volumes mounted
+    config                        shell with only mixin volumes (user-global setup)
   runtime {info,init}         in-container ops on volume content
+    info                          show project info
+    init                          seed .saturn/Containerfile template
 
 Top-level:
-  base, up, down, shell, exec
+  up, down, shell, exec, put, get
+    up <name>                     build project image + start container
+    down <name>                   stop+remove container (volumes kept)
+    shell <name>                  interactive shell in project container
+    exec <name> <cmd> [args...]   run command in project container
+    put <name> <src> [<dst>]      copy host file/dir into project volume
+    get <name> <src> [<dst>]      copy file/dir out of project volume
+
+Mixins (user-global state — ~/.ssh, ~/.config/gh, ~/.claude, ...):
+  base template --mixins <a,b>    print Containerfile with mixin install lines
+  base default  --mixins <a,b>    rebuild base with mixin install lines
+  up <name>     --mixins <a,b>    additionally mount mixin volumes
+  project config [--mixins <a,b>] shell with only mixin volumes (set up auth)
 """
 
 from __future__ import annotations
@@ -32,14 +55,19 @@ SCRIPT = Path(__file__).resolve()
 
 BASE_IMAGE = os.environ.get("SATURN_BASE_IMAGE", "localhost/saturn-base:latest")
 
-# The base image is built from this inlined Containerfile. `saturn base` writes
+# The base image is built from this inlined Containerfile. The build writes
 # it to a temp dir alongside a copy of this very script (for `COPY saturn ...`)
 # so the distribution unit is a single file: `saturn` itself.
 #
-# To customize, point SATURN_BASE_CONTAINERFILE at your own file; it replaces
-# the text below but the build context (with saturn copied in) is the same, so
-# overrides MUST keep `COPY saturn /usr/local/bin/saturn` for nesting to work.
-BASE_CONTAINERFILE_TEXT = """\
+# Split into HEAD + TAIL so mixin install commands can be spliced between
+# the base packages layer and the `COPY saturn` step.
+#
+# To customize:
+#   saturn base template > my.Containerfile   # edit in place, keep COPY saturn ...
+#   saturn base build my.Containerfile        # rebuild from your file
+# Custom Containerfiles MUST keep `COPY saturn /usr/local/bin/saturn` for
+# nesting to work (the build context always has saturn copied in).
+BASE_CONTAINERFILE_HEAD = """\
 FROM docker.io/library/debian:trixie-slim
 
 RUN groupadd -g 10001 agent \\
@@ -51,7 +79,9 @@ RUN apt-get update \\
  && rm -rf /var/lib/apt/lists/* \\
  && echo 'agent ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/agent \\
  && chmod 440 /etc/sudoers.d/agent
+"""
 
+BASE_CONTAINERFILE_TAIL = """\
 COPY saturn /usr/local/bin/saturn
 RUN chmod 0755 /usr/local/bin/saturn
 
@@ -60,6 +90,127 @@ USER agent:agent
 
 CMD ["sleep", "infinity"]
 """
+
+
+# ---------- mixins -------------------------------------------------------
+#
+# Each mixin bundles: an install snippet spliced into the base Containerfile
+# (`command`), a target path inside the container where the user-global state
+# lives (`target`), and optionally a `subpath` within the volume when the
+# target is a single file rather than a directory (e.g. ~/.claude.json).
+#
+# Volumes are named `saturn_mixin_<name>` (hyphens in the mixin name become
+# underscores) and are labelled `saturn.volume=mixin`, `saturn.mixin=<name>`
+# so they're discoverable and cleanly distinguished from project ws volumes.
+#
+# `command` is a shell string. Empty means "no install step" (for pure
+# state-only mixins like `config` or `claude-json`). Non-empty commands are
+# rendered as `RUN <cmd>` between `USER 0` / `USER agent:agent` guards so
+# apt/install steps run as root.
+MIXINS: dict[str, dict] = {
+    "ssh": {
+        "target": "/home/agent/.ssh",
+        "command": (
+            "apt-get update"
+            " && apt-get install -y --no-install-recommends openssh-client"
+            " && rm -rf /var/lib/apt/lists/*"
+        ),
+    },
+    "gh": {
+        "target": "/home/agent/.config/gh",
+        "command": (
+            "apt-get update"
+            " && apt-get install -y --no-install-recommends gh"
+            " && rm -rf /var/lib/apt/lists/*"
+        ),
+    },
+    "claude": {
+        "target": "/home/agent/.claude",
+        "command": (
+            "apt-get update"
+            " && apt-get install -y --no-install-recommends curl ca-certificates nodejs npm"
+            " && npm install -g @anthropic-ai/claude-code"
+            " && rm -rf /var/lib/apt/lists/*"
+        ),
+    },
+    "claude-json": {
+        "target": "/home/agent/.claude.json",
+        "subpath": "claude.json",
+        "command": "",
+    },
+    "codex": {
+        "target": "/home/agent/.codex",
+        "command": (
+            "apt-get update"
+            " && apt-get install -y --no-install-recommends curl ca-certificates nodejs npm"
+            " && npm install -g @openai/codex"
+            " && rm -rf /var/lib/apt/lists/*"
+        ),
+    },
+    "emacs": {
+        "target": "/home/agent/.emacs.d",
+        "command": (
+            "apt-get update"
+            " && apt-get install -y --no-install-recommends emacs-nox"
+            " && rm -rf /var/lib/apt/lists/*"
+        ),
+    },
+    "xdg-config": {
+        "target": "/home/agent/.config",
+        "command": "",
+    },
+}
+
+# Applied by every mixin-aware command when `--mixins` is not passed. Pass
+# `--mixins ''` (empty) to opt out explicitly.
+DEFAULT_MIXINS: list[str] = ["ssh", "claude", "claude-json", "codex", "gh"]
+
+
+def _render_base_containerfile(mixin_names: list[str]) -> str:
+    if not mixin_names:
+        return BASE_CONTAINERFILE_HEAD + "\n" + BASE_CONTAINERFILE_TAIL
+    lines = ["USER 0"]
+    for n in mixin_names:
+        cmd = MIXINS[n]["command"].strip()
+        if cmd:
+            lines.append(f"RUN {cmd}")
+    lines.append("USER agent:agent")
+    mixin_block = "\n".join(lines) + "\n"
+    return BASE_CONTAINERFILE_HEAD + "\n" + mixin_block + "\n" + BASE_CONTAINERFILE_TAIL
+
+
+# Used by `ensure_base()` on first-use auto-build, so a bare `saturn up`
+# produces a container consistent with the mixins that `up` will default-mount.
+BASE_CONTAINERFILE_TEXT = _render_base_containerfile(DEFAULT_MIXINS)
+
+
+def _parse_mixin_list(spec: str | None) -> list[str]:
+    if not spec:
+        return []
+    names = [s.strip() for s in spec.split(",") if s.strip()]
+    unknown = [n for n in names if n not in MIXINS]
+    if unknown:
+        sys.exit(
+            f"unknown mixin(s): {unknown}"
+            f"  (known: {', '.join(MIXINS)})"
+        )
+    return names
+
+
+def _cli_mixins(raw: str | None) -> list[str]:
+    """Resolve a `--mixins` CLI value.
+
+    - `raw is None` means the user did not pass `--mixins` → use DEFAULT_MIXINS.
+    - Any explicit value (including `--mixins ''`) is parsed verbatim, so the
+      empty string is the way to opt out of defaults.
+    """
+    if raw is None:
+        return list(DEFAULT_MIXINS)
+    return _parse_mixin_list(raw)
+
+
+def _mixin_vol(name: str) -> str:
+    return f"saturn_mixin_{name.replace('-', '_')}"
 
 # SATURN_ENGINE names the host's rootless engine family — it no longer picks
 # the CLI binary (we always shell out to `docker`), only the default socket
@@ -189,21 +340,13 @@ def project_exists(name: str) -> bool:
 
 # ---------- shared runtime helpers ---------------------------------------
 
-def _build_base() -> None:
+def _build_base(containerfile_text: str) -> None:
     """Build saturn-base from a temp context that always contains a copy of
-    this script (so `COPY saturn` works). SATURN_BASE_CONTAINERFILE, if set,
-    replaces the Containerfile text but reuses the same context."""
-    override = os.environ.get("SATURN_BASE_CONTAINERFILE")
+    this script (so `COPY saturn` works)."""
     with tempfile.TemporaryDirectory(prefix="saturn-base-") as td:
         tdp = Path(td)
         cf = tdp / "Containerfile"
-        if override:
-            op = Path(override)
-            if not op.is_file():
-                sys.exit(f"SATURN_BASE_CONTAINERFILE not found: {op}")
-            cf.write_text(op.read_text())
-        else:
-            cf.write_text(BASE_CONTAINERFILE_TEXT)
+        cf.write_text(containerfile_text)
         shutil.copy(SCRIPT, tdp / "saturn")
         engine("build", "-f", str(cf), "-t", BASE_IMAGE, td)
 
@@ -212,7 +355,7 @@ def ensure_base() -> None:
     if engine_ok("image", "inspect", BASE_IMAGE):
         return
     print(f"building base image: {BASE_IMAGE} (first time only)")
-    _build_base()
+    _build_base(BASE_CONTAINERFILE_TEXT)
 
 
 def check_socket() -> None:
@@ -237,6 +380,113 @@ def ensure_volume(vol_name: str, project: str, marker: str) -> None:
     )
 
 
+def ensure_mixin_volume(name: str) -> None:
+    """Create and prep the user-global volume for a mixin, idempotently.
+
+    For subpath (file-target) mixins, pre-touches the subpath file so that
+    `volume-subpath=<path>` mounts succeed on first use — the engine requires
+    the subpath to exist inside the volume at mount time.
+    """
+    vol = _mixin_vol(name)
+    if engine_ok("volume", "inspect", vol):
+        return
+    engine_quiet(
+        "volume", "create",
+        "--label", "saturn.volume=mixin",
+        "--label", f"saturn.mixin={name}",
+        vol,
+    )
+    subpath = MIXINS[name].get("subpath")
+    if subpath:
+        setup = f"touch /mnt/{subpath} && chown -R 10001:10001 /mnt"
+    else:
+        setup = "chown 10001:10001 /mnt"
+    engine_quiet(
+        "run", "--rm", "--init", "--user", "0",
+        "-v", f"{vol}:/mnt",
+        BASE_IMAGE,
+        "sh", "-c", setup,
+    )
+
+
+def _mixin_mount_args(mixin_names: list[str]) -> list[str]:
+    """Build `docker run` args that mount each mixin volume at its target.
+
+    Side effect: ensures each mixin volume exists (and is chowned / has its
+    subpath file pre-touched) before handing back the flags.
+    """
+    args: list[str] = []
+    for n in mixin_names:
+        ensure_mixin_volume(n)
+        spec = MIXINS[n]
+        vol = _mixin_vol(n)
+        target = spec["target"]
+        subpath = spec.get("subpath")
+        if subpath:
+            args += [
+                "--mount",
+                f"type=volume,source={vol},target={target},volume-subpath={subpath}",
+            ]
+        else:
+            args += ["-v", f"{vol}:{target}"]
+    return args
+
+
+def _is_path_parent_of(parent: str, child: str) -> bool:
+    """True iff `parent` is a strict path-component prefix of `child`.
+
+    String-prefix checks are insufficient ("/foo" would match "/foobar");
+    we require the next char to be "/" so path components align.
+    """
+    if parent == child:
+        return False
+    p = parent.rstrip("/") or "/"
+    return child.startswith(p + "/") if p != "/" else child.startswith("/") and child != "/"
+
+
+def _check_mount_overlap(mounts: list[tuple[str, str]]) -> None:
+    """Fail-fast check on a planned set of (label, target) mounts.
+
+    - `sys.exit`s on exact-target collisions (would otherwise surface as
+      an opaque engine error, "Duplicate mount point: <path>").
+    - Emits an advisory `note:` to stderr for nested targets. Both docker and
+      podman sort mounts shortest-prefix-first and apply them in that order,
+      so nesting is safe — the inner mount simply takes over its subpath.
+      See docs/experiment_journal/mount-ordering-nested-vs-duplicate-targets.md.
+
+    The caller includes every mount target planned for a `docker run`:
+    socket, ws (when applicable), and each selected mixin's target.
+    """
+    norm = [(lbl, (t.rstrip("/") or "/")) for lbl, t in mounts]
+    n = len(norm)
+    for i in range(n):
+        la, a = norm[i]
+        for j in range(i + 1, n):
+            lb, b = norm[j]
+            if a == b:
+                sys.exit(
+                    f"mount target collision: {la} and {lb} "
+                    f"both resolve to {a}"
+                )
+            if _is_path_parent_of(a, b):
+                parent, parent_p, child, child_p = la, a, lb, b
+            elif _is_path_parent_of(b, a):
+                parent, parent_p, child, child_p = lb, b, la, a
+            else:
+                continue
+            print(
+                f"note: {parent} ({parent_p}) contains {child} ({child_p}); "
+                f"engine will mount {parent} first and {child} will override "
+                f"its subpath.",
+                file=sys.stderr,
+            )
+
+
+def _planned_mixin_mounts(mixin_names: list[str]) -> list[tuple[str, str]]:
+    """(label, target) pairs for each mixin — used by the overlap check."""
+    return [(f"mixin:{n}", MIXINS[n]["target"]) for n in mixin_names]
+
+
 def container_status(name: str) -> str:
     return engine_out("inspect", "-f", "{{.State.Status}}", name) or ""
 
@@ -258,10 +508,27 @@ def _project_env_flags(p: Project) -> list[str]:
 
 # ---------- commands: base ----------------------------------------------
 
-def cmd_base(_args: argparse.Namespace) -> None:
+def cmd_base_template(args: argparse.Namespace) -> None:
+    mixins = _cli_mixins(getattr(args, "mixins", None))
+    sys.stdout.write(_render_base_containerfile(mixins))
+
+
+def cmd_base_default(args: argparse.Namespace) -> None:
+    mixins = _cli_mixins(getattr(args, "mixins", None))
     engine_ok("rmi", BASE_IMAGE)
-    print(f"building base image: {BASE_IMAGE}")
-    _build_base()
+    print(f"building base image: {BASE_IMAGE}"
+          + (f" (mixins: {', '.join(mixins)})" if mixins else " (no mixins)"))
+    _build_base(_render_base_containerfile(mixins))
+    print(f"base ready: {BASE_IMAGE}")
+
+
+def cmd_base_build(args: argparse.Namespace) -> None:
+    path = Path(args.file)
+    if not path.is_file():
+        sys.exit(f"Containerfile not found: {path}")
+    engine_ok("rmi", BASE_IMAGE)
+    print(f"building base image: {BASE_IMAGE} from {path}")
+    _build_base(path.read_text())
     print(f"base ready: {BASE_IMAGE}")
 
 
@@ -286,22 +553,40 @@ def cmd_project_rm(args: argparse.Namespace) -> None:
     p = Project(args.name)
     if not project_exists(p.name):
         sys.exit(f"no such project: {p.name}")
-    prompt = (
-        f"remove container {p.container}, volume {p.vol_ws}, "
-        f"and image {p.image}?\n"
-        f"type project name ({p.name}) to confirm: "
-    )
-    try:
-        ans = input(prompt)
-    except EOFError:
-        ans = ""
-    if ans != p.name:
-        sys.exit("aborted")
+    if not args.force:
+        prompt = (
+            f"remove container {p.container}, volume {p.vol_ws}, "
+            f"and image {p.image}?\n"
+            f"type project name ({p.name}) to confirm: "
+        )
+        try:
+            ans = input(prompt)
+        except EOFError:
+            ans = ""
+        if ans != p.name:
+            sys.exit("aborted")
     engine_ok("rm", "-f", p.container)
     engine_ok("rm", "-f", p.bootstrap_container)
     engine_ok("volume", "rm", p.vol_ws)
     engine_ok("rmi", p.image)
     print(f"removed: {p.name}")
+
+
+def cmd_project_config(args: argparse.Namespace) -> None:
+    mixins = _cli_mixins(args.mixins)
+    check_socket()
+    ensure_base()
+    _check_mount_overlap([
+        ("socket", "/var/run/docker.sock"),
+        *_planned_mixin_mounts(mixins),
+    ])
+    engine_exec(
+        "run", "--rm", *_interactive_flags(), "--init",
+        *_mixin_mount_args(mixins),
+        "-v", f"{HOST_SOCK}:/var/run/docker.sock",
+        BASE_IMAGE,
+        "/bin/bash",
+    )
 
 
 def cmd_project_shell(args: argparse.Namespace) -> None:
@@ -365,15 +650,23 @@ def cmd_up(args: argparse.Namespace) -> None:
         return
     if status:
         engine_ok("rm", "-f", p.container)
+    mixins = _cli_mixins(getattr(args, "mixins", None))
+    _check_mount_overlap([
+        ("ws", p.ws_mount),
+        ("socket", "/var/run/docker.sock"),
+        *_planned_mixin_mounts(mixins),
+    ])
     engine_quiet(
         "run", "-d", "--init", "--name", p.container,
         "-v", f"{p.vol_ws}:{p.ws_mount}",
         "-v", f"{HOST_SOCK}:/var/run/docker.sock",
+        *_mixin_mount_args(mixins),
         "-w", p.ws_mount,
         *_project_env_flags(p),
         p.image,
     )
-    print(f"up: {p.container}")
+    print(f"up: {p.container}"
+          + (f"  (mixins: {', '.join(mixins)})" if mixins else ""))
 
 
 def cmd_down(args: argparse.Namespace) -> None:
@@ -384,11 +677,17 @@ def cmd_down(args: argparse.Namespace) -> None:
 
 # ---------- commands: put/get -------------------------------------------
 
-def _validate_vol_rel(path: str, role: str) -> None:
+def _resolve_vol_path(p: Project, path: str, role: str) -> str:
+    """Return the helper-container path for a put/get argument.
+
+    Relative paths are rooted at the ws mount; absolute paths pass through so
+    callers can paste full paths as they appear inside the container.
+    """
     if path.startswith("/"):
-        sys.exit(f"{role} must be a relative path inside the project root: {path!r}")
+        return path
     if ".." in Path(path).parts:
-        sys.exit(f"{role} must not contain '..': {path!r}")
+        sys.exit(f"{role} must not contain '..' (use an absolute path instead): {path!r}")
+    return f"{p.ws_mount}/{path}"
 
 
 def _with_cp_helper(p: Project, fn) -> None:
@@ -419,12 +718,12 @@ def cmd_put(args: argparse.Namespace) -> None:
     if not Path(src_raw).exists():
         sys.exit(f"source not found: {src_raw}")
     dst = args.dst or Path(src_raw).name or "."
-    _validate_vol_rel(dst, "dst")
+    vol_dst = _resolve_vol_path(p, dst, "dst")
 
     def do(tmp: str) -> None:
-        parent = f"{p.ws_mount}/{Path(dst).parent}"
+        parent = str(Path(vol_dst).parent)
         engine_quiet("exec", "--user", "0", tmp, "mkdir", "-p", parent)
-        engine("cp", src_raw, f"{tmp}:{p.ws_mount}/{dst}")
+        engine("cp", src_raw, f"{tmp}:{vol_dst}")
         # Fix storage-level ownership so `agent` owns the new content.
         # Chown the whole ws to catch any new intermediate parent dirs — safe
         # since saturn is the only writer.
@@ -443,11 +742,11 @@ def cmd_get(args: argparse.Namespace) -> None:
         sys.exit(f"no such project: {p.name}")
     check_socket()
     ensure_base()
-    _validate_vol_rel(args.src, "src")
+    vol_src = _resolve_vol_path(p, args.src, "src")
     dst = args.dst or "."
 
     def do(tmp: str) -> None:
-        engine("cp", f"{tmp}:{p.ws_mount}/{args.src}", dst)
+        engine("cp", f"{tmp}:{vol_src}", dst)
 
     _with_cp_helper(p, do)
     print(f"get: {p.name}:{args.src} -> {dst}")
@@ -511,7 +810,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         prog="saturn",
-        description="minimal per-project dev container CLI (rootless podman/docker)",
+        description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "env vars:\n"
@@ -521,16 +820,47 @@ def main() -> None:
             "  SATURN_SUDO         '1' to prefix sudo (auto-set inside)\n"
             "  SATURN_PROJECT      (inside only) project name; used by runtime cmds\n"
             "  SATURN_BASE_IMAGE   default: localhost/saturn-base:latest\n"
-            "  SATURN_BASE_CONTAINERFILE  optional override file (must COPY saturn\n"
-            "                             /usr/local/bin/saturn); default is inlined\n"
         ),
     )
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("base", help="(re)build the base image").set_defaults(fn=cmd_base)
+    base = sub.add_parser("base", help="base image lifecycle")
+    base_sub = base.add_subparsers(dest="subcommand")
+    bt = base_sub.add_parser(
+        "template", help="print default Containerfile to stdout",
+    )
+    bt.add_argument(
+        "--mixins", default=None,
+        help="comma-separated mixin names to splice in "
+             f"(known: {', '.join(MIXINS)}; "
+             f"default: {','.join(DEFAULT_MIXINS)}; pass '' for none)",
+    )
+    bt.set_defaults(fn=cmd_base_template)
+    bd = base_sub.add_parser(
+        "default", help="(re)build base from inlined default",
+    )
+    bd.add_argument(
+        "--mixins", default=None,
+        help="comma-separated mixin names to splice in "
+             f"(known: {', '.join(MIXINS)}; "
+             f"default: {','.join(DEFAULT_MIXINS)}; pass '' for none)",
+    )
+    bd.set_defaults(fn=cmd_base_default)
+    bb = base_sub.add_parser("build", help="(re)build base from a Containerfile")
+    bb.add_argument(
+        "file",
+        help="path to a Containerfile (must COPY saturn /usr/local/bin/saturn)",
+    )
+    bb.set_defaults(fn=cmd_base_build)
 
     p_up = sub.add_parser("up", help="build project image + start container")
     p_up.add_argument("name")
+    p_up.add_argument(
+        "--mixins", default=None,
+        help="comma-separated mixin names; mounts the corresponding "
+             f"user-global volumes (known: {', '.join(MIXINS)}; "
+             f"default: {','.join(DEFAULT_MIXINS)}; pass '' for none)",
+    )
     p_up.set_defaults(fn=cmd_up)
 
     p_down = sub.add_parser("down", help="stop+remove container (volumes kept)")
@@ -568,10 +898,23 @@ def main() -> None:
     pn.set_defaults(fn=cmd_project_new)
     pr = proj_sub.add_parser("rm", help="remove container, volumes, image")
     pr.add_argument("name")
+    pr.add_argument("-f", "--force", action="store_true",
+                    help="skip confirmation prompt")
     pr.set_defaults(fn=cmd_project_rm)
     ps = proj_sub.add_parser("shell", help="base-image shell with project volumes mounted")
     ps.add_argument("name")
     ps.set_defaults(fn=cmd_project_shell)
+    pc = proj_sub.add_parser(
+        "config",
+        help="shell with only mixin volumes mounted — set up user-global state",
+    )
+    pc.add_argument(
+        "--mixins", default=None,
+        help="comma-separated mixin names "
+             f"(known: {', '.join(MIXINS)}; "
+             f"default: {','.join(DEFAULT_MIXINS)}; pass '' for none)",
+    )
+    pc.set_defaults(fn=cmd_project_config)
 
     rt = sub.add_parser("runtime", help="in-container ops on volume content")
     rt_sub = rt.add_subparsers(dest="subcommand")

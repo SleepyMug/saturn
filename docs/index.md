@@ -16,6 +16,7 @@ Implementation: one Python file, stdlib-only, ~500 lines. All engine mutations f
 - [components/cli/](components/cli/index.md) — Argparse subparser tree, `main()` dispatch, and a sys.argv intercept for `exec` so user commands keep their flags.
 - [components/project/](components/project/index.md) — Derives every engine resource name from a single `<name>`. Projects exist iff their ws volume exists; discovery is label-based.
 - [components/base-image/](components/base-image/index.md) — Single-file distribution: the saturn-base Containerfile is inlined as a Python string; the build context is assembled in a temp dir with a copy of saturn itself.
+- [components/mixins/](components/mixins/index.md) — Named bundles of (install snippet + user-global volume + target path) that carry per-user state like SSH keys, gh tokens, or Claude auth into project containers.
 - [components/engine/](components/engine/index.md) — Subprocess wrappers around the `docker` CLI + socket/env setup. The only module that calls subprocess.
 - [boundaries/engine-socket.md](boundaries/engine-socket.md) — The bind-mounted `/var/run/docker.sock` is a user-namespace boundary: which inside-uid can open it depends on rootless vs rootful and on sudo use.
 - [boundaries/nested-env.md](boundaries/nested-env.md) — The env contract that lets saturn inside a saturn container create siblings on the host engine — distinct from the *host* shell's env, whose role is limited.
