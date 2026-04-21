@@ -444,10 +444,11 @@ def passthrough(argv: list[str]) -> None:
 
     cmd = ["docker", "compose", "-f", str(compose_json), "-p", project, *argv]
     r = subprocess.run(cmd)
-    # For `exec`/`run` the exit code comes from the child process, not compose
-    # itself — skip the debug banner so a clean Ctrl-D out of `saturn shell`
-    # (or any non-zero child status) doesn't look like a saturn failure.
-    if r.returncode != 0 and argv[0] not in ("exec", "run"):
+    # Banner is for non-obvious compose failures. Suppress when the non-zero
+    # came from the user (SIGINT = 130) or from a child process whose exit
+    # compose forwards verbatim (`exec`, `run`) — e.g. bash exiting with the
+    # last command's status on Ctrl-D out of `saturn shell`.
+    if r.returncode not in (0, 130) and argv[0] not in ("exec", "run"):
         print(f"\n(docker compose exited {r.returncode} — ran: {' '.join(cmd)})",
               file=sys.stderr)
     sys.exit(r.returncode)

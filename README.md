@@ -1,8 +1,8 @@
 # saturn
 
-Single-file Python wrapper over `docker compose` for rootless podman / rootless Docker. A **workspace** is any directory with a `.saturn/compose.yaml` in it. Saturn passes the compose spec through a small translation step and forwards to `docker compose` — so `saturn up`, `saturn down`, `saturn exec dev bash`, `saturn logs -f`, `saturn ps` all just work. The translation step pre-resolves env vars + paths and, inside a saturn container, rewrites bind-mount sources from inside paths to the real host paths by inspecting the current container through the host engine socket.
+Single-file Python wrapper over `docker compose` for rootless podman / rootless Docker. A **workspace** is any directory with a `.saturn/compose.yaml` in it. Saturn passes the compose spec through a small translation step and forwards to `docker compose` — so `saturn up`, `saturn down`, `saturn shell`, `saturn logs -f`, `saturn ps` all just work. The translation step pre-resolves env vars + paths and, inside a saturn container, rewrites bind-mount sources from inside paths to the real host paths by inspecting the current container through the host engine socket.
 
-The container runs as root; rootless userns maps that to your host user, so files written from inside land on disk with host-user ownership. Works at any nesting level.
+The container runs as root; rootless userns maps that to your host user, so files written from inside land on disk with host-user ownership. Works at any nesting level (pass `--socket` to `saturn new` on the outer workspace — see flags below).
 
 ## Install
 
@@ -50,7 +50,7 @@ export SATURN_BASE_IMAGE=localhost/saturn-base:latest  # or a custom tag
 saturn new ~/code/myproj                               # workspace Dockerfile FROMs your base
 ```
 
-When the base already has a tool baked in, skip the matching `saturn new --<flag>` and add the bind-mount line to `.saturn/compose.yaml` by hand — otherwise the workspace Dockerfile duplicates the install step. The flag is a convenience for a minimal base; with a fat base, the compose volume is the only thing you still need.
+Each `saturn new --<flag>` does two things: appends an install step to the workspace `Dockerfile`, and appends a bind-mount to `compose.yaml`. Prebaking replaces only the first. If your custom base already has (say) `gh` installed, dropping `--gh` from `saturn new` avoids re-running the install, but you must still add `- ${HOME}/.config/gh:/root/.config/gh` to the workspace's `compose.yaml` by hand — otherwise `gh` inside the container will have no auth config. Same pattern for `ssh`, `claude`, `codex`.
 
 ## Usage
 
@@ -74,7 +74,7 @@ Pass-through covers the full docker-compose surface: `up`, `up -d`, `down`, `exe
 | `--gh` | `apt install gh` | `${HOME}/.config/gh:/root/.config/gh` |
 | `--claude` | `curl -fsSL https://claude.ai/install.sh \| bash` | `${HOME}/.claude:/root/.claude` + `${HOME}/.claude.json:/root/.claude.json` |
 | `--codex` | `apt install nodejs npm` + `npm i -g @openai/codex` | `${HOME}/.codex:/root/.codex` |
-| `--socket` | (none) | `${SATURN_SOCK}:/var/run/docker.sock` (lets inner saturn reach the host engine) |
+| `--socket` | (none) | `${SATURN_SOCK}:/var/run/docker.sock` — required if you want nested `saturn` or plain `docker` to work inside the container |
 
 ### Starting a workspace
 
@@ -93,6 +93,8 @@ mkdir -p ~/code/myproj && cd ~/code/myproj
 saturn new --ssh --claude --socket
 saturn up -d
 ```
+
+Always use `-d`. Bare `saturn up` attaches to the `dev` service, whose command is `sleep infinity` — you'll see no output, and Ctrl+C stops the container. Saturn prints a reminder if you forget.
 
 Inside the container, you start in `/root/myproj` — which is `~/code/myproj` on the host, bind-mounted.
 
@@ -114,7 +116,7 @@ docker ps --filter name=saturn_
 
 ### Nested saturn
 
-Every saturn container has `saturn` and `docker` installed, plus the host engine socket mounted (if you passed `--socket` to `saturn new`). Inside, you can launch a sibling container on the host engine for any subdirectory of the current workspace:
+Every saturn container has `saturn` and `docker` installed; if you passed `--socket` to `saturn new`, the host engine socket is bind-mounted too, which is what lets both `docker` and nested `saturn` inside talk to the host engine. With the socket in place, you can launch a sibling container on the host engine for any subdirectory of the current workspace:
 
 ```sh
 # inside ~/code/myproj's container (cwd = /root/myproj):
@@ -197,13 +199,17 @@ The fix: route every operation through the user-level podman API service, which 
 ```sh
 # one-time
 systemctl --user enable --now podman.socket
+```
 
-# ~/.bashrc
+Saturn itself already sets `DOCKER_HOST` (to the first of `$XDG_RUNTIME_DIR/podman/podman.sock`, `$XDG_RUNTIME_DIR/docker.sock`, `/var/run/docker.sock` that exists) and `DOCKER_BUILDKIT=0` at import, so `saturn <anything>` funnels through the socket automatically. The exports below are only for when you invoke `docker` yourself, outside saturn, from the same shell:
+
+```sh
+# ~/.bashrc — only needed for bare `docker` commands outside saturn
 export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock
 export DOCKER_BUILDKIT=0
 ```
 
-Always use `docker` instead of `podman`. Saturn and compose both funnel through `DOCKER_HOST` automatically. `DOCKER_BUILDKIT=0` is required because podman's docker-compat socket doesn't serve the BuildKit API.
+Always use `docker` instead of `podman`. `DOCKER_BUILDKIT=0` is required because podman's docker-compat socket doesn't serve the BuildKit API.
 
 **Don't mix.** Every direct `podman` invocation bypasses the serializer and reintroduces the race.
 
