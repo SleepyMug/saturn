@@ -19,7 +19,7 @@ Seeds `<target>/.saturn/{Dockerfile,compose.yaml}` from templates.
 3. `mkdir -p <target>/.saturn`; write `Dockerfile` and `compose.yaml` if absent (never overwrites).
 4. Host mode only: for each flag, auto-create the host-side source path if missing (`mkdir -p` for dirs, `touch` for files) so the first `up` doesn't fail the bind mount. Guest mode skips auto-create.
 
-Flags are independently opt-in; omitting all gives a minimal workspace with just the source tree bind-mounted. Order is not significant.
+Flags are independently opt-in. If none of `--ssh`/`--gh`/`--claude`/`--codex` is passed, `cmd_new` sets all three of ssh/gh/claude to True after argparse so a bare `saturn new` produces a fully-loaded dev workspace. `--socket` is orthogonal and does not count toward this check — `saturn new --socket` still gets the ssh/gh/claude defaults. To get a truly minimal workspace (no bind mounts beyond the source tree), pass any single mixin flag (e.g. `--ssh`) and remove it from the generated `compose.yaml` / `Dockerfile` afterward, or edit the templates directly.
 
 | Flag | Dockerfile effect | compose.yaml effect | Auto-create target |
 |---|---|---|---|

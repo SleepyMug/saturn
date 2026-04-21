@@ -34,7 +34,7 @@ saturn base build my-base.Dockerfile
 
 Pass-through covers the full docker-compose surface: `up`, `up -d`, `down`, `exec dev <cmd>`, `logs -f`, `ps`, `restart dev`, `build`, and so on.
 
-`saturn new` flags (all independently opt-in):
+`saturn new` flags. If none of `--ssh`/`--gh`/`--claude`/`--codex` is passed, it defaults to `--ssh --gh --claude`. `--socket` is independent.
 
 | Flag | Adds to `Dockerfile` | Adds to `compose.yaml` volumes |
 |---|---|---|

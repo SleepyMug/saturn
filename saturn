@@ -13,6 +13,8 @@ Commands:
   new [dir]  [--ssh] [--gh] [--claude] [--codex] [--socket]
                   create <dir>/.saturn/{Dockerfile,compose.yaml}.
                   flags append install blocks + bind mounts.
+                  if none of --ssh/--gh/--claude/--codex is passed,
+                  defaults to --ssh --gh --claude.
   base default       (re)build localhost/saturn-base:latest from inlined default
   base build <file>  (re)build the base from a user-supplied Dockerfile
   shell              alias for `saturn exec dev bash`
@@ -175,6 +177,12 @@ def cmd_new(args: argparse.Namespace) -> None:
     name = target.name
     if not name or " " in name or name.startswith("."):
         sys.exit(f"invalid workspace basename: {name!r}  (from path {target})")
+
+    # If the user didn't pick any of the mixin-style flags, seed the
+    # common defaults (ssh + gh + claude). --socket is orthogonal and
+    # does not count as "specifying a mixin" for this check.
+    if not (args.ssh or args.gh or args.claude or args.codex):
+        args.ssh = args.gh = args.claude = True
 
     saturn_dir = target / ".saturn"
     saturn_dir.mkdir(parents=True, exist_ok=True)
