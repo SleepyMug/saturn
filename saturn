@@ -104,14 +104,14 @@ _DF_INSTALL = {
         " && apt-get install -y --no-install-recommends gh \\\n"
         " && rm -rf /var/lib/apt/lists/*\n"
     ),
-    # Shared node base for claude + codex.
-    "node": (
+    "claude": "RUN curl -fsSL https://claude.ai/install.sh | bash\n",
+    # codex needs nodejs+npm.
+    "codex": (
         "RUN apt-get update \\\n"
         " && apt-get install -y --no-install-recommends nodejs npm \\\n"
-        " && rm -rf /var/lib/apt/lists/*\n"
+        " && rm -rf /var/lib/apt/lists/* \\\n"
+        " && npm install -g @openai/codex\n"
     ),
-    "claude": "RUN npm install -g @anthropic-ai/claude-code\n",
-    "codex":  "RUN npm install -g @openai/codex\n",
 }
 
 _COMPOSE_HEAD = """\
@@ -187,12 +187,10 @@ def cmd_new(args: argparse.Namespace) -> None:
             parts.append(_DF_INSTALL["ssh"])
         if args.gh:
             parts.append(_DF_INSTALL["gh"])
-        if args.claude or args.codex:
-            parts.append(_DF_INSTALL["node"])
-            if args.claude:
-                parts.append(_DF_INSTALL["claude"])
-            if args.codex:
-                parts.append(_DF_INSTALL["codex"])
+        if args.claude:
+            parts.append(_DF_INSTALL["claude"])
+        if args.codex:
+            parts.append(_DF_INSTALL["codex"])
         df.write_text("".join(parts))
         print(f"seeded:  {df}")
 

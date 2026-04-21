@@ -40,11 +40,9 @@ Pass-through covers the full docker-compose surface: `up`, `up -d`, `down`, `exe
 |---|---|---|
 | `--ssh` | `apt install openssh-client` | `${HOME}/.ssh:/root/.ssh` |
 | `--gh` | `apt install gh` | `${HOME}/.config/gh:/root/.config/gh` |
-| `--claude` | `apt install nodejs npm` + `npm i -g @anthropic-ai/claude-code` | `${HOME}/.claude:/root/.claude` + `${HOME}/.claude.json:/root/.claude.json` |
+| `--claude` | `curl -fsSL https://claude.ai/install.sh \| bash` | `${HOME}/.claude:/root/.claude` + `${HOME}/.claude.json:/root/.claude.json` |
 | `--codex` | `apt install nodejs npm` + `npm i -g @openai/codex` | `${HOME}/.codex:/root/.codex` |
 | `--socket` | (none) | `${SATURN_SOCK}:/var/run/docker.sock` (lets inner saturn reach the host engine) |
-
-(When both `--claude` and `--codex` are passed, the `nodejs npm` install is deduplicated.)
 
 ### Starting a workspace
 

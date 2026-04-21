@@ -25,11 +25,9 @@ Flags are independently opt-in; omitting all gives a minimal workspace with just
 |---|---|---|---|
 | `--ssh` | `RUN apt-get install openssh-client` | `- ${HOME}/.ssh:/root/.ssh` | `~/.ssh` (dir) |
 | `--gh` | `RUN apt-get install gh` | `- ${HOME}/.config/gh:/root/.config/gh` | `~/.config/gh` (dir) |
-| `--claude` | `RUN apt-get install nodejs npm && npm i -g @anthropic-ai/claude-code` | `- ${HOME}/.claude:/root/.claude`, `- ${HOME}/.claude.json:/root/.claude.json` | `~/.claude` (dir), `~/.claude.json` (file) |
+| `--claude` | `RUN curl -fsSL https://claude.ai/install.sh \| bash` | `- ${HOME}/.claude:/root/.claude`, `- ${HOME}/.claude.json:/root/.claude.json` | `~/.claude` (dir), `~/.claude.json` (file) |
 | `--codex` | `RUN apt-get install nodejs npm && npm i -g @openai/codex` | `- ${HOME}/.codex:/root/.codex` | `~/.codex` (dir) |
 | `--socket` | (none) | `- ${SATURN_SOCK}:/var/run/docker.sock` | — |
-
-When both `--claude` and `--codex` are passed, the `nodejs npm` install is emitted once, followed by the two `npm install -g` lines.
 
 ### `_find_workspace() -> Path`
 
