@@ -12,6 +12,19 @@ The container runs as root; rootless userns maps that to your host user, so file
 - **No custom config schema.** `compose.yaml` is the source of truth. If you know compose, you know saturn — the whole tool is "translate + hand off to `docker compose`".
 - **Root inside the container is the right default.** Rootless userns remapping turns container-uid-0 into your host user at the bind-mount boundary, so files written from inside land on disk owned by you. No uid-matching build args, no chown-on-mount dance.
 
+## Conventions
+
+Nested rootless container usage is the underlying problem, and the reason saturn can be this thin is a small set of conventions that carry the weight. Saturn (the script) implements what we have by assuming them — any container built to satisfy them can host saturn inside.
+
+- **Workspace = a directory with `.saturn/compose.yaml`.** Discovered by walking cwd upward; no registry, no global index.
+- **`compose.yaml` is the source of truth.** Saturn never parses compose-shaped input itself; it post-processes `docker compose config --format json`.
+- **Host engine socket bind-mounted at `/var/run/docker.sock`.** The single boundary crossing — everything saturn learns about the outside world comes through it.
+- **Two-var env contract: `SATURN_IN_GUEST=1` and `SATURN_SOCK=/var/run/docker.sock`.** Static workspace-level config; no per-launch data. Previous versions propagated one env var per mixin; all gone.
+- **Default container hostname.** `docker inspect $(hostname)` is saturn's self-identity; don't override `hostname:` in a workspace `compose.yaml`.
+- **Reverse mount lookup as the translation primitive.** Inside a guest, `.Mounts` from self-inspect is the ground-truth map from inside-paths to host-paths — one generic lookup subsumes every host-path env var saturn used to need.
+
+The detailed spec — image requirements, the exact bind-mount list, env var semantics — lives in [API saturn consumes](#api-saturn-consumes). A container meeting that spec can run saturn, whether saturn seeded it or not.
+
 ## Prerequisites
 
 - **Rootless podman** (with `systemctl --user enable --now podman.socket`) **or rootless Docker**. Rootful engines work technically but produce host-root-owned files on bind mounts.
