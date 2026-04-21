@@ -1,5 +1,7 @@
 # 0004 — Discover projects via a `saturn.volume=ws` label filter
 
+> **Partially superseded by [0007](0007-drop-agent-user-use-is-sandbox.md).** Label-based engine discovery still applies, but the label now lives on **containers** (`saturn.project=<name>` via `docker ps -a --filter label=saturn.project`), not volumes. Host-side discovery (listing subdirs of `$HOME/saturn/`) complements the engine query; the final list is their union.
+
 > `project ls` runs `docker volume ls --filter label=saturn.volume=ws` and strips the `saturn_ws_` prefix. One hit per project, no dedupe needed.
 
 ## Context

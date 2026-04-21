@@ -4,7 +4,7 @@
 
 ## Overview
 
-When saturn launches a container (`up` or `project shell`), it injects a specific block of `SATURN_*` environment variables. Inside, saturn re-reads those on startup and derives its own behavior, allowing nested invocations to act on the host engine transparently. The same env var *names* appear on the host and inside a container but play different roles — the inside role must not leak into host-shell defaults.
+When saturn launches a container (`saturn up`), it injects a specific block of `SATURN_*` + `HOME` environment variables. Inside, saturn re-reads those on startup and derives its own behavior, so nested invocations act on the host engine transparently. Two variables hold **host-side** paths and are the load-bearing pieces for nesting: `SATURN_HOST_SOCK` and `SATURN_HOST_HOME`.
 
 ## Both sides' perspective
 
@@ -15,44 +15,42 @@ Vars the user may set to customize host-side saturn:
 - `SATURN_ENGINE=podman|docker` — host engine family (default `podman`). Only picks the default socket path; saturn always shells to `docker`.
 - `SATURN_SOCK=<path>` — explicit socket path override.
 - `SATURN_BASE_IMAGE=<ref>` — override base image tag.
+- `SATURN_HOST_HOME=<path>` — override the host-side home (default `$HOME` / `Path.home()`). Normally unnecessary.
 
-Vars the user must NOT set on the host:
+Vars the user should NOT set on the host:
 
-- `SATURN_SUDO` — if `1` on the host, saturn will prepend `sudo` to every docker call, which breaks rootless setups.
 - `SATURN_HOST_SOCK` — meaningful only inside a container; the default (`SOCK`) is correct for host.
-- `SATURN_PROJECT` — meaningful only inside (sets runtime-command scope); setting on host does nothing useful and invites confusion. Rejected as an ambient default in [decisions/0001-single-file-distribution.md](../decisions/0001-single-file-distribution.md) (see also the note about "fake simplicity" in the user-decision history).
 
 ### Inside a saturn container
 
-saturn injects these in `_project_env_flags(p)`:
+saturn injects these via `_env_flags()`:
 
 | Var | Value at injection | Role inside |
 |---|---|---|
-| `SATURN_ENGINE` | `docker` | Socket default path is `/run/user/<uid>/docker.sock` — unused inside since `SATURN_SOCK` is always explicit. |
+| `SATURN_ENGINE` | the host's `ENGINE` (e.g. `podman` or `docker`) | Identifies the actual engine family behind the bind-mounted socket. Drives the BuildKit-vs-classic-builder decision inside. |
 | `SATURN_SOCK` | `/var/run/docker.sock` | Inside path of the bind-mounted host socket; inside saturn sets `DOCKER_HOST=unix://...` from this. |
-| `SATURN_HOST_SOCK` | `<host's SOCK>` | **Host-side** path. When the nested saturn creates another child container, this is the path it bind-mounts. Without propagating this, double-nesting would break (the inner saturn would try to bind-mount `/var/run/docker.sock`, which is a container path, not a host path). |
-| `SATURN_SUDO` | `1` | Causes `_engine_cmd` to prepend sudo; required because `agent` can't open the socket directly. |
-| `SATURN_PROJECT` | `<name>` | Project identity; `runtime info`/`init` key off this to find the ws mount. |
+| `SATURN_HOST_SOCK` | `<host's SOCK>` | **Host-side** path. When the nested saturn creates another child container, this is the path it bind-mounts. Without propagating, double-nesting would try to bind-mount `/var/run/docker.sock` (a container path) on the host. |
+| `SATURN_HOST_HOME` | `<host's HOST_HOME>` | **Host-side** `$HOME` path. Used both as the bind-mount source for `-v HOST_HOME:HOST_HOME` on siblings and as the value of `HOME` inside (see next row). |
+| `HOME` | `<host's HOST_HOME>` | Override container-root's default `HOME=/root` so `~/.ssh`, `~/.claude.json`, `~/.config/gh`, etc. resolve to the bind-mounted host home. |
 
 ## Data representation at the boundary
 
-Plain env vars (strings) passed via `docker run -e KEY=VALUE`. No escaping concerns — saturn's values are known-safe (paths, `0`/`1`, enum strings, validated project names).
+Plain env vars (strings) passed via `docker run -e KEY=VALUE`. No escaping concerns — saturn's values are known-safe (paths, enum strings, validated project names).
 
 ## Ownership and lifecycle
 
 - Host saturn owns the *contents* of each var and injects a fresh set on every `docker run` (no persistence).
 - Inside saturn reads them once at module import; after that they're effectively immutable for that process.
-- `SATURN_HOST_SOCK` is the only var whose value is the host-side path — all others are inside-relative. This asymmetry is load-bearing for double-nesting.
+- `SATURN_HOST_SOCK` and `SATURN_HOST_HOME` are the only vars whose values are host-side paths — all others are inside-relative. This asymmetry is load-bearing for nesting.
 
 ## Constraints per side
 
 ### Host constraints
 
-- Must never have `SATURN_SUDO=1` or `SATURN_HOST_SOCK` leaked from a previous `saturn shell` session. The docker CLI's `-e` mechanism doesn't back-propagate; the host's shell env is independent of the container's.
-- If the user wants to change socket targets, set `SATURN_SOCK` and optionally `SATURN_ENGINE`, nothing else.
+- Must not have `SATURN_HOST_SOCK` leaked from a previous inside session. Normally no-op since `SATURN_HOST_SOCK` defaults to `SOCK`, but an explicit stale value would be wrong.
+- `SATURN_HOST_HOME` defaults to `Path.home()`. Override only if you know why.
 
 ### Container constraints
 
-- `SATURN_PROJECT` is inside-only (consumed by `runtime info`/`init`). Host commands take `<name>` positionally; they don't consult `SATURN_PROJECT`.
-- `SATURN_HOST_SOCK` is meaningful only as the host-side path string. If saturn inside ever tries to open it for itself (rather than re-bind-mount it), it'll fail — inside has no access to a path at `/run/user/1000/...` on the host namespace.
-- These vars must not override the inside-side defaults for `SOCK` or `USE_SUDO`; saturn's module-level init honors them verbatim. A user who `-e SATURN_SUDO=0`'s an exec into a running container can accidentally break its ability to hit the socket.
+- `SATURN_HOST_SOCK` and `SATURN_HOST_HOME` are meaningful only as host-side paths. If inside saturn ever tries to `open()` them directly (rather than re-bind-mount), it'll fail — inside has no access to a path at `/run/user/1000/...` on the host namespace (the mount only covers `$HOME`, not the runtime dir).
+- These vars must not override the inside-side defaults for `SOCK`; saturn's module-level init honors them verbatim.

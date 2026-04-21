@@ -1,5 +1,7 @@
 # 0003 — Unified rootless/sudo recipe; one CLI; socket serialization
 
+> **Superseded by [0007](0007-drop-agent-user-use-is-sandbox.md).** Containers now run as root, so no sudo is needed. The socket-access story simplifies: container-uid 0 maps to host-user under rootless userns and can open the socket directly. The "one CLI, always `docker`" and "don't shell to `podman` directly" rules remain in force.
+
 > Inside saturn containers, always `sudo docker ...`. This single recipe covers rootless podman, rootless Docker, rootful docker, and rootful podman. saturn never shells to `podman` directly.
 
 ## Context

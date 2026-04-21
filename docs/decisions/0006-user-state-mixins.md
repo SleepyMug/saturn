@@ -1,5 +1,7 @@
 # 0006 — User-state mixins: install-in-base + user-global volumes
 
+> **Superseded by [0007](0007-drop-agent-user-use-is-sandbox.md).** The mixin system is gone. Saturn bind-mounts the host `$HOME` path-symmetrically into every container, so `~/.ssh`, `~/.claude.json`, `~/.config/gh`, etc. come along for free. Tools are no longer installed by saturn; install them in your project Containerfile instead. The "bind-mount host directories" option rejected below is exactly what 0007 adopts — the rejection was based on 0002's zero-host-state goal, which 0007 also abandons.
+
 > Per-user state like `~/.ssh`, `~/.config/gh`, `~/.claude`, `~/.claude.json`, `~/.codex`, `~/.emacs.d`, `~/.config` enters project containers via named **mixins**: an optional install snippet spliced into the base Containerfile plus a user-global named volume mounted at the target path inside the project container.
 
 ## Context

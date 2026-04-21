@@ -4,9 +4,9 @@
 
 ## Overview
 
-Every engine mutation goes through one of five wrappers which prepend `sudo` if `SATURN_SUDO=1` is set, then always `docker <args>`. Socket path, `DOCKER_HOST`, and `DOCKER_BUILDKIT=0` are derived at module import time from a small env contract.
+Every engine mutation goes through one of five wrappers: `engine`, `engine_quiet`, `engine_ok`, `engine_out`, `engine_exec`. Each invokes `docker <args>` — no sudo, never `podman`. Socket path, `DOCKER_HOST`, and (for podman only) `DOCKER_BUILDKIT=0` are derived at module import time from a small env contract.
 
-Choosing `docker` as the CLI (rather than branching on `podman` vs `docker`) means saturn works identically against rootless podman's docker-compat API and rootless Docker. See [decisions/0003-sudo-over-group-add.md](../../decisions/0003-sudo-over-group-add.md).
+Choosing `docker` as the CLI (rather than branching on `podman` vs `docker`) means saturn works identically against rootless podman's docker-compat API and rootless Docker.
 
 ## Provided APIs
 
@@ -16,14 +16,10 @@ Choosing `docker` as the CLI (rather than branching on `podman` vs `docker`) mea
 |---|---|---|
 | `ENGINE` | `SATURN_ENGINE`, default `podman` | Picks the default socket path only; CLI is always `docker`. |
 | `SOCK` | `SATURN_SOCK`, default derived from `ENGINE` + `XDG_RUNTIME_DIR` | Socket this saturn invocation talks to. |
-| `HOST_SOCK` | `SATURN_HOST_SOCK`, default `SOCK` | Host-side path that gets bind-mounted into child containers. |
-| `USE_SUDO` | `SATURN_SUDO == "1"` | Prepend sudo to every engine call. |
+| `HOST_SOCK` | `SATURN_HOST_SOCK`, default `SOCK` | Host-side path bind-mounted into child containers at `/var/run/docker.sock`. |
+| `HOST_HOME` | `SATURN_HOST_HOME` or `Path.home()` | Host-side `$HOME` bind-mounted into child containers path-symmetrically. |
 
-At import: `os.environ["DOCKER_HOST"] = f"unix://{SOCK}"` and `os.environ["DOCKER_BUILDKIT"] = "0"`. These flow to both saturn's own docker calls and to subprocesses that inherit env.
-
-### `_engine_cmd(*args: str) -> list[str]`
-
-Returns `["sudo", "docker", *args]` if `USE_SUDO` else `["docker", *args]`. All other wrappers build on this.
+At import: `os.environ["DOCKER_HOST"] = f"unix://{SOCK}"`. `DOCKER_BUILDKIT=0` is additionally set **only when `ENGINE == "podman"`** — podman's docker-compat socket doesn't serve BuildKit. Docker (including rootless) serves BuildKit; forcing it off triggers a deprecation warning and loses features.
 
 ### Subprocess wrappers
 
@@ -33,37 +29,39 @@ Returns `["sudo", "docker", *args]` if `USE_SUDO` else `["docker", *args]`. All 
 | `engine_quiet(*args)` | Same but stdout+stderr are `DEVNULL`. Used for idempotent create/rm calls we don't want to narrate. |
 | `engine_ok(*args)` | Returns `True` iff the call succeeds; `DEVNULL`s output. For idempotent operations where presence/absence is the question. |
 | `engine_out(*args)` | Returns captured stdout as a stripped `str`, or `None` on failure. For `inspect -f '{{...}}'` queries. |
-| `engine_exec(*args)` | `os.execvp` — replaces the current process. Used for interactive `run`/`exec` so saturn steps out of the way for the user's shell. |
+| `engine_exec(*args)` | `os.execvp` — replaces the current process. Used for interactive `exec` so saturn steps out of the way for the user's shell. |
 
 ### Runtime helpers
 
-These aren't strictly "engine ops" but they live next to the wrappers and are the primitives used by every command.
+These live next to the wrappers and are the primitives used by every command.
 
-- `check_socket() -> None` — asserts `SOCK` is a socket file, else exits with a clear message. Called before any engine mutation that needs the daemon.
+- `check_socket() -> None` — asserts `SOCK` is a socket file, else exits with a clear message.
 - `container_status(name) -> str` — `engine_out("inspect", "-f", "{{.State.Status}}", name)` or empty string if the container doesn't exist.
-- `_interactive_flags() -> list[str]` — `["-it"]` if stdin is a TTY, else `["-i"]`. Required because docker CLI rejects `-t` without a TTY (podman was forgiving).
-- `_project_env_flags(p) -> list[str]` — the canonical block of `-e SATURN_ENGINE=docker -e SATURN_SOCK=... -e SATURN_HOST_SOCK=... -e SATURN_SUDO=1 -e SATURN_PROJECT=<name>` that gets injected into every child saturn container. See [boundaries/nested-env.md](../../boundaries/nested-env.md).
+- `_interactive_flags() -> list[str]` — `["-it"]` if stdin is a TTY, else `["-i"]`. Required because docker CLI rejects `-t` without a TTY.
+- `_env_flags() -> list[str]` — the canonical block of `-e SATURN_ENGINE=... -e SATURN_SOCK=/var/run/docker.sock -e SATURN_HOST_SOCK=<host-sock> -e SATURN_HOST_HOME=<host-home> -e HOME=<host-home>` injected into every child saturn container. See [boundaries/nested-env.md](../../boundaries/nested-env.md).
+- `_base_mount_flags() -> list[str]` — the canonical `-v $SATURN_ROOT:$SATURN_ROOT -v $HOST_SOCK:/var/run/docker.sock` pair applied to every saturn container. The projects root is always mounted path-symmetrically so nested saturn can read/write any project; nothing else from `$HOME` comes in automatically.
+- [`_mixin_mount_flags`, `_check_mixin_paths`](../mixins/index.md#provided-apis) — `up`'s additional per-mixin bind-mounts layered on top of `_base_mount_flags()`.
 
 ## Consumed APIs
 
 None within the codebase — this is the leaf module. Externally, consumes:
 
-- `docker` CLI (classic builder path).
-- `sudo` when `USE_SUDO=1` (only inside containers).
+- `docker` CLI.
 - Unix domain socket at `$SOCK`.
 
 ## Workflows
 
 ### Nested propagation
 
-1. Host: `saturn up demo` runs with `USE_SUDO=0`, `SOCK=/run/user/1000/podman/podman.sock`, `HOST_SOCK=/run/user/1000/podman/podman.sock`.
-2. The project container starts with `-e SATURN_SUDO=1 -e SATURN_SOCK=/var/run/docker.sock -e SATURN_HOST_SOCK=/run/user/1000/podman/podman.sock -v /run/user/1000/podman/podman.sock:/var/run/docker.sock` (plus `SATURN_ENGINE=docker` and `SATURN_PROJECT=demo`).
-3. Inside: `saturn exec demo sh` → inside `sh`, run `saturn project ls`. saturn re-reads env, computes `USE_SUDO=True`, `SOCK=/var/run/docker.sock`, prepends sudo; listing returns the same set of projects as from the host.
+1. Host: `saturn up demo` runs with `SOCK=/run/user/1000/podman/podman.sock`, `HOST_SOCK=/run/user/1000/podman/podman.sock`, `HOST_HOME=/home/guest`.
+2. The project container starts with `-v /home/guest/saturn:/home/guest/saturn -v /run/user/1000/podman/podman.sock:/var/run/docker.sock` (plus any `--mixins` paths, plus env propagation).
+3. Inside: `saturn ls` re-reads the env, talks to `/var/run/docker.sock`, scans `/home/guest/saturn/` (bind-mounted), and prints the same list as the host.
+4. Inside: `saturn up demo2` spawns a sibling on the host engine using the propagated host-side paths as bind-mount *sources* — not the inside-container ones.
 
-The `HOST_SOCK` env var is what makes double-nesting work: when the nested saturn creates *another* child container, it bind-mounts the *original* host socket path (not `/var/run/docker.sock`, which is a container-local path and wouldn't resolve on the host).
+Without `SATURN_HOST_SOCK` / `SATURN_HOST_HOME`, double-nesting would try to bind-mount `/var/run/docker.sock` and inside paths on the host — those don't resolve there.
 
 ## Execution-context constraints
 
-- **Classic builder only.** `DOCKER_BUILDKIT=0` is set at import; the podman docker-compat socket doesn't serve BuildKit.
-- **No direct podman calls.** A saturn developer tempted to `podman volume inspect` for speed would bypass the serializer (since rootless podman has no persistent daemon) and reintroduce store-corruption races. See [decisions/0003-sudo-over-group-add.md](../../decisions/0003-sudo-over-group-add.md) and the README's "Avoiding podman storage races" section.
+- **Classic builder required on podman.** When `ENGINE == "podman"`, saturn forces `DOCKER_BUILDKIT=0` at module import. The env flows to any subprocess saturn spawns.
+- **No direct podman calls.** Bypassing the socket opens the rootless store directly and reintroduces store-corruption races. The README's "Avoiding podman storage races" section spells this out.
 - **`os.execvp` is terminal.** After `engine_exec`, saturn is replaced by the child process — trailing cleanup code won't run. Callers must complete everything else first.

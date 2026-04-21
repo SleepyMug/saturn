@@ -1,5 +1,7 @@
 # 0005 — Lifecycle commands do not seed content
 
+> **Superseded by [0007](0007-drop-agent-user-use-is-sandbox.md).** `saturn new <name>` now seeds `.saturn/Containerfile` if absent. The collision scenario (user clones a repo into a freshly-templated ws volume) doesn't arise: with a host directory, the user edits on the host using their normal tools; cloning means picking a different project name or running `git clone` into the dir themselves with the seeded file in their way (which they can delete). `runtime init` is gone along with the whole `runtime` group.
+
 > `project new` creates labelled volumes and chowns them; it does not write files. Template scaffolding is a `runtime` command run from inside a bootstrap shell.
 
 ## Context

@@ -1,5 +1,7 @@
 # 0002 — Zero host state; projects discovered by volume labels
 
+> **Superseded by [0007](0007-drop-agent-user-use-is-sandbox.md).** Projects are now host directories under `$HOME/saturn/<name>/`, not named volumes. The "zero host state" goal was abandoned once empirical tests showed rootless userns handles bind-mount ownership cleanly.
+
 > All per-project content (Containerfile, source, `.git`) lives in the ws volume. No `.saturn/` on host. `project ls` queries engine volume labels.
 
 ## Context

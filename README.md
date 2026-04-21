@@ -1,8 +1,6 @@
 # saturn
 
-Minimal per-project dev-container CLI for rootless podman and rootless Docker. A saturn container runs as a non-root user (`agent`, uid 10001), has the docker CLI wired up to the host engine's socket, and keeps your source in a named volume so your host filesystem stays clean. Works at any nesting level — running `saturn` inside a saturn container creates siblings on the host engine.
-
-**Zero host state.** Projects are discovered by labels on their volumes; all per-project content (Containerfile, source, `.git/`) lives inside `saturn_ws_<name>` and is committed with the project's own git. User-global state (SSH keys, `gh`/Claude/Codex auth, editor config) is expressed via **mixins** — see *Mixins* below.
+Minimal per-project dev-container CLI for rootless podman and rootless Docker. Each project is a host directory under `$HOME/saturn/<name>/`; the engine socket and host `$HOME` are bind-mounted in; the container runs as root (rootless userns maps that back to your host user). Works at any nesting level — `saturn` inside a saturn container creates siblings on the host engine.
 
 ## Install
 
@@ -17,138 +15,138 @@ Custom base image:
 
 ```sh
 saturn base template > my.Containerfile    # print the inlined default
-$EDITOR my.Containerfile                    # tweak it — keep `COPY saturn /usr/local/bin/saturn`
+$EDITOR my.Containerfile                    # tweak — keep `COPY saturn /usr/local/bin/saturn` and `ENV IS_SANDBOX=1`
 saturn base build my.Containerfile          # rebuild localhost/saturn-base from your file
 ```
-
-Your override must keep `COPY saturn /usr/local/bin/saturn` — saturn copies itself into the build context alongside your file so nesting continues to work.
 
 ## Quick start
 
 ```sh
-./saturn base default                      # one-time: build saturn-base
+saturn base default                 # one-time: build saturn-base
+saturn new myproj                   # creates ~/saturn/myproj/ with a template .saturn/Containerfile
+$EDITOR ~/saturn/myproj/.saturn/Containerfile   # optional: add project tooling
+saturn up myproj                    # build project image + start container
+saturn shell myproj                 # interactive shell; cwd = ~/saturn/myproj
 
-# Option A — scaffold a fresh project
-saturn project new myproj                  # creates labelled ws volume
-saturn project shell myproj                # base-image shell on the volumes
-  # inside: saturn runtime init              seed .saturn/Containerfile template
-  #         $EDITOR .saturn/Containerfile   add project tooling (FROM saturn-base)
-  #         exit
-saturn up myproj                           # build project image + start container
-saturn shell myproj                        # drop into the project container
-
-# Option B — bring your own repo (clone from inside)
-saturn project new myproj
-saturn project shell myproj
-  # inside: git clone <url> .               (repo must have .saturn/Containerfile)
-  #         exit
+# import an existing repo:
+saturn new myproj                   # creates the dir
+git clone <url> ~/saturn/myproj     # (or edit files directly)
 saturn up myproj
 
-# Option C — import an existing host directory
-saturn project new myproj
-saturn put myproj ~/path/to/existing-project/. .   # trailing /. -> copy contents
-  # if the imported tree lacks .saturn/Containerfile, scaffold one:
-  # saturn project shell myproj   →   saturn runtime init   →   exit
-saturn up myproj
-
-# day to day
-saturn shell myproj                        # bash as agent
-saturn exec myproj <cmd> [args...]         # one-off command
-saturn down myproj                         # stop+remove container (volumes kept)
-saturn project ls                          # list projects
-saturn project rm myproj                   # remove container, volumes, image
-
-# move files in/out of the project volume (works whether project is up or down)
-saturn put myproj <host-src> [<dst>]       # host -> project (default dst = basename)
-saturn get myproj <src> [<host-dst>]       # project -> host (default host-dst = .)
+# day to day:
+saturn ls                           # list projects
+saturn exec myproj <cmd> [args...]  # one-off command
+saturn down myproj                  # stop+remove container (host dir kept)
+saturn rm myproj                    # stop container, remove image, rm -rf host dir (confirms)
+saturn rm myproj -f                 # skip confirmation
 ```
 
-Inside the container, `saturn runtime info` shows project + paths; the same `saturn` binary also works nested (creates siblings on the host engine via the propagated socket).
+Inside the container, `cd` into `~/saturn/myproj` — the same path as on the host (`$HOME` is bind-mounted path-symmetrically). The `saturn` CLI works from inside too; it creates siblings on the host engine via the propagated socket.
+
+## How the container is wired
+
+Every `saturn up` does:
+
+- `-v $HOME/saturn:$HOME/saturn` — the projects root is visible inside at the same path, so you can navigate/create any project from inside.
+- For each selected mixin path, `-v $HOME/<path>:$HOME/<path>` — specific credential/config paths brought in path-symmetrically (see **Mixins** below). No other parts of `$HOME` are exposed.
+- `-v $SOCK:/var/run/docker.sock` — the engine socket, so `docker` inside works against the host engine.
+- `-e HOME=$HOME` — container-root's home is set to your host home so `~/.ssh`, `~/.claude.json`, etc. resolve to the bind-mounted host paths (when their mixin is selected).
+- `-e SATURN_HOST_HOME=$HOME -e SATURN_HOST_SOCK=$SOCK` — propagated for nesting; saturn-in-saturn uses these to bind-mount the real host paths into its siblings.
+- `--label saturn.project=<name>` — for `saturn ls`.
+- Runs as root; rootless userns maps that to your host user, so writes land on disk with host-user ownership.
+
+The base image carries `ENV IS_SANDBOX=1`, which tells Claude Code (and similar tools) that `--dangerously-skip-permissions` is intentional. Without it they refuse to run as root.
 
 ## Mixins
 
-Mixins carry user-global state (SSH keys, `gh` tokens, Claude/Codex auth, editor config) into project containers without bind-mounting host directories. Each mixin bundles:
+Mixins are named bundles of (HOME-relative paths + install snippet) that carry user-global state into project containers without exposing the whole `$HOME`. Each mixin declares:
 
-- an optional install snippet spliced into the base Containerfile (`RUN <cmd>`),
-- a user-global named volume (`saturn_mixin_<name>`, labeled `saturn.volume=mixin`),
-- a target path inside the container where the volume is mounted (with `volume-subpath=` for file targets like `~/.claude.json`).
+- **`paths`** — a list of HOME-relative strings (e.g. `.ssh`, `.claude.json`). Each is bind-mounted path-symmetrically (`-v $HOME/<path>:$HOME/<path>`) on `saturn up`.
+- **`setup`** — an optional shell snippet spliced into the base Containerfile as `RUN <setup>`, so the tool is installed once at base-image build time.
 
-Built-in mixins: `ssh`, `gh`, `claude`, `claude-json`, `codex`, `emacs`, `xdg-config`.
+Built-ins: `ssh`, `gh`, `claude`, `codex`. Edit the `MIXINS` dict at the top of the `saturn` script to add your own.
 
-The default set, used whenever `--mixins` is omitted, is `ssh,claude,claude-json,codex,gh` — so a bare `saturn up myproj` mounts all of these (and the first-use base-image build installs their tools). Pass `--mixins ''` to opt out, or `--mixins <csv>` to pick a different set.
+Defaults: `--mixins` omitted → `ssh,claude,codex,gh`. Pass `--mixins ''` to opt out. Pass `--mixins <csv>` to pick a different set.
 
 ```sh
-# 1. Install the tools into saturn-base (run once, or whenever you change the list):
-saturn base default                          # uses defaults: ssh,claude,claude-json,codex,gh
-saturn base default --mixins ssh,gh,claude,claude-json   # pick a different set
+# Install the tools into saturn-base:
+saturn base default                          # uses defaults
+saturn base default --mixins ssh,gh          # different set
+saturn base default --mixins ''              # no mixin tools
 
-# 2. Populate the user-global state interactively — shell has ONLY mixin volumes mounted:
-saturn project config                        # defaults: ssh,claude,claude-json,codex,gh mounted
-saturn project config --mixins ssh           # just ssh — then: ssh-keygen -t ed25519
-saturn project config --mixins gh            # just gh — then: gh auth login
-saturn project config --mixins claude-json,emacs,xdg-config  # the non-default ones
+# Set up credentials on the host (once — they live in your real $HOME):
+ssh-keygen -t ed25519                        # ~/.ssh
+gh auth login                                # ~/.config/gh
+# claude / codex: run once on host to populate ~/.claude + ~/.claude.json / ~/.codex
 
-# 3. Mount the state into a project container:
-saturn up myproj                             # defaults: ssh,claude,claude-json,codex,gh
-saturn up myproj --mixins ssh,gh,claude,claude-json,emacs    # custom set
-saturn up myproj --mixins ''                 # opt out of all mixins
+# Mount them into project containers:
+saturn up myproj                             # defaults
+saturn up myproj --mixins ssh,gh             # custom set
+saturn up myproj --mixins ''                 # plain container
 ```
 
-Mixin volumes live outside project lifecycle — `saturn project rm` never touches them. To edit the mixin registry (add a tool, change a command or target), edit `MIXINS` in the `saturn` script itself.
+If a selected mixin's path doesn't exist on the host, `saturn up` fails fast with the missing path named. Create it (or drop the mixin) and retry.
 
-`saturn base build <file>` does not accept `--mixins` (user files are used verbatim). Combine a custom base with mixins via: `saturn base template --mixins ... > my.Containerfile`, edit, `saturn base build my.Containerfile`.
+## Project Containerfiles
 
-Engine requirement: `volume-subpath=` (used for file-target mixins like `claude-json`) needs Docker 25.0+ or Podman 4.7+.
+`saturn new <name>` seeds `~/saturn/<name>/.saturn/Containerfile` with:
+
+```dockerfile
+FROM localhost/saturn-base:latest
+
+# Add project tooling here. Example:
+#   RUN apt-get update \
+#    && apt-get install -y --no-install-recommends ripgrep \
+#    && rm -rf /var/lib/apt/lists/*
+```
+
+Edit freely. Everything installs and runs as root. If the file is missing, `saturn up` just runs the base image directly.
 
 ## Avoiding podman storage races
 
-Rootless podman has no always-on daemon. Every `podman` CLI invocation opens `~/.local/share/containers/storage/` directly and mutates it. **Concurrent invocations race and can corrupt the store** — resulting in cryptic `locating item named "manifest"` errors on later calls.
+Rootless podman has no always-on daemon. Every `podman` CLI invocation opens `~/.local/share/containers/storage/` directly and mutates it. **Concurrent invocations race and can corrupt the store** — cryptic `locating item named "manifest"` errors follow.
 
-The fix: **route every operation through the user-level podman API service**, which serializes store mutations the same way `dockerd` does.
+The fix: **route every operation through the user-level podman API service**, which serializes store mutations like `dockerd` does.
 
 ```sh
-# ensure the service is enabled (one-time):
+# one-time
 systemctl --user enable --now podman.socket
 
-# and in your shell (~/.bashrc):
+# ~/.bashrc
 export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock
 export DOCKER_BUILDKIT=0
 ```
 
-Then always use `docker` instead of `podman` — the docker CLI speaks podman's docker-compat API, and all invocations funnel through the single service process. `DOCKER_BUILDKIT=0` is required because podman's socket doesn't serve the BuildKit API; the classic builder talks the protocol it does serve.
+Then always use `docker` instead of `podman` — the docker CLI speaks podman's docker-compat API, and all invocations funnel through the single service process. `DOCKER_BUILDKIT=0` is required because podman's socket doesn't serve the BuildKit API.
 
-Saturn already does this internally. If you sometimes reach for `podman` directly out of habit, know that every such invocation bypasses the serializer and reintroduces the race. **Don't mix the two.**
+Saturn already does this internally. If you sometimes reach for `podman` directly, know that every such invocation bypasses the serializer and reintroduces the race. **Don't mix the two.**
 
 ## What containers can run saturn
 
 Any Linux image that contains:
 
 - `python3` (stdlib is enough; no third-party deps)
-- the `docker` CLI (`docker-cli` package on Debian, `docker-cli` on Alpine)
-- `sudo` with NOPASSWD configured for the non-root user
-- a non-root user to run as (convention: `agent`, uid/gid 10001)
+- the `docker` CLI (`docker-cli` on Debian)
 - `/usr/local/bin/saturn` (the script, mode 0755)
 
 At runtime the container additionally needs:
 
 - the host engine socket bind-mounted at `/var/run/docker.sock`
-- env vars `SATURN_SOCK=/var/run/docker.sock`, `SATURN_HOST_SOCK=<real host path>`, `SATURN_SUDO=1`, and `SATURN_PROJECT=<name>` — **auto-propagated by `saturn up` and `saturn project shell`** when one saturn container spawns another
+- the projects root (`$HOME/saturn/`) bind-mounted path-symmetrically
+- any selected mixin paths bind-mounted path-symmetrically
+- env vars `SATURN_SOCK=/var/run/docker.sock`, `SATURN_HOST_SOCK=<real host path>`, `SATURN_HOST_HOME=<real host path>`, `HOME=<real host path>` — **auto-propagated by `saturn up`** when one saturn container spawns another
+- `IS_SANDBOX=1` if you want tools like Claude Code to accept running as root
 
 The shipped `saturn-base` image (Debian trixie slim) satisfies all of these. Project images inherit everything by starting from it:
 
 ```dockerfile
-# .saturn/Containerfile  (lives inside saturn_ws_<name>, committed with your repo)
+# ~/saturn/<name>/.saturn/Containerfile
 FROM localhost/saturn-base:latest
-
-USER 0
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ripgrep \
  && rm -rf /var/lib/apt/lists/*
-USER agent:agent
 ```
-
-Roll-your-own equivalents on Alpine/Fedora/etc. work too — the list above is what matters, not the distro.
 
 ## Security note
 
-Bind-mounting the host engine socket into a container is equivalent to granting full control of your rootless engine ("host-you"). Saturn is a dev tool; do not expose the socket into production containers.
+Saturn bind-mounts the host engine socket (full control of your rootless engine), the projects root (`$HOME/saturn/`, so inside saturn can manage siblings), and each selected mixin path (credentials like SSH keys and API tokens). The blast radius is smaller than mounting the whole `$HOME`, but still not small — the socket alone grants full engine access. Dev-time convenience only; do not run untrusted code through saturn. `IS_SANDBOX=1` is a tool-level affirmation that root is intentional, not an actual sandbox.

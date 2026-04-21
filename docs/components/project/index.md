@@ -1,12 +1,10 @@
 # Project model
 
-> Derives every engine resource name from a single `<name>`. Projects exist iff their ws volume exists; discovery is label-based.
+> Derives every engine resource name from a single `<name>`. Projects exist as host directories under `$HOST_HOME/saturn/`; discovery unions dir listing with container labels.
 
 ## Overview
 
-A "project" in saturn is a tuple of engine-managed resources whose names are mechanically derived from one string. There is no project file, no config registry, no `.saturn/` directory on the host — `project_list()` interrogates the engine's volume index directly.
-
-Per-project volumes carry labels `saturn.project=<name>` + `saturn.volume=ws`. Orthogonal to projects, user-global **mixin** volumes ([mixins](../mixins/index.md)) carry `saturn.volume=mixin` + `saturn.mixin=<mixin-name>` and are never touched by project lifecycle commands — they survive across all `project rm` operations.
+A "project" in saturn is a tuple of (host directory, container, image) whose names are mechanically derived from one string. There is no project registry; `project_list()` interrogates the filesystem and the engine directly and unions the results.
 
 ## Provided APIs
 
@@ -18,65 +16,61 @@ Constructor validates the name (non-empty, no `/`, no leading `.`, no spaces) an
 |---|---|---|
 | `name` | the input | identity |
 | `container` | `saturn_<name>` | running project container |
-| `bootstrap_container` | `saturn_bootstrap_<name>` | transient base-image shell for pre-image access |
-| `image` | `localhost/saturn-<name>:latest` | project image (built from volume) |
-| `vol_ws` | `saturn_ws_<name>` | workspace named volume |
-| `ws_mount` | `/home/agent/<name>` | mount path inside the container |
+| `image` | `localhost/saturn-<name>:latest` | project image (built from the host dir) |
+| `host_dir` | `$HOST_HOME/saturn/<name>` | project host directory |
+| `containerfile()` | `<host_dir>/.saturn/Containerfile` | optional per-project Containerfile |
 
-All derivation is pure string formatting; there is no persistence of these mappings anywhere outside the naming convention.
+All derivation is pure string/path formatting.
 
-### `ws_mount_for(name: str) -> str`
+### `SATURN_ROOT: Path`
 
-Returns `/home/agent/<name>`. Called from runtime commands inside the container, which only know the name (from `SATURN_PROJECT` env) and must reconstruct the mount path.
+`Path(HOST_HOME) / "saturn"` — where projects live. `HOST_HOME` comes from `SATURN_HOST_HOME` (when set, e.g. inside a nested saturn) or falls back to `Path.home()`.
+
+### `CONTAINERFILE_REL: str`
+
+`.saturn/Containerfile` — relative to the project dir. Build context is the project dir itself.
+
+### `CONTAINERFILE_TEMPLATE: str`
+
+Seed content written by `saturn new`: `FROM localhost/saturn-base:latest` plus a commented `RUN apt-get …` example. Runs as root (no USER directive).
 
 ### `project_list() -> list[str]`
 
-Runs `docker volume ls --filter label=saturn.volume=ws --format '{{.Name}}'`, strips the `saturn_ws_` prefix, returns sorted names. Filtering on the `ws`-marker label guarantees one hit per project with no dedupe logic needed.
+Unions two sources:
 
-### `project_exists(name: str) -> bool`
+1. Directory children of `$SATURN_ROOT` that look like projects — not hidden, and containing a `.saturn/` subdirectory (the marker created by `saturn new`). This filter keeps unrelated subdirs of `$HOME/saturn/` out of the listing.
+2. Containers carrying a `saturn.project` label — picked up via `docker ps -a --filter label=saturn.project --format '{{index .Labels "saturn.project"}}'`.
 
-`docker volume inspect saturn_ws_<name>` — true iff the call succeeds.
-
-### `ensure_volume(vol_name, project, marker) -> None`
-
-Idempotent create-with-labels: if the volume already exists, returns. Otherwise:
-
-1. `docker volume create --label saturn.project=<project> --label saturn.volume=<marker> <vol_name>`.
-2. `docker run --rm --init --user 0 -v <vol_name>:/mnt saturn-base chown 10001:10001 /mnt` — fresh volumes are owned by root at the storage level; the chown shifts ownership so the non-root `agent` user in the image can write.
+The union surfaces projects that exist only as a host dir (never started) and projects that exist only as a container (host dir was removed out-of-band).
 
 ## Consumed APIs
 
-- [`engine`, `engine_ok`, `engine_quiet`, `engine_out`](../engine/index.md#provided-apis) — all engine calls.
-- [`BASE_IMAGE`](../base-image/index.md#provided-apis) — transient container image for the chown step.
+- [`engine_out`](../engine/index.md#provided-apis) — for the container-label listing.
 
 ## Workflows
 
-### Discovery (`project ls`)
+### Discovery (`saturn ls`)
 
-1. `engine_out("volume", "ls", "--filter", "label=saturn.volume=ws", "--format", "{{.Name}}")`.
-2. Strip `saturn_ws_` prefix.
-3. Sort and print.
+1. List dirs under `$HOST_HOME/saturn/`.
+2. Ask the engine for container labels.
+3. Sort the union and print.
 
-Filtering on the `ws`-marker label (rather than just `saturn.project`) gives one entry per project even if later versions add additional labelled volumes per project.
+### Creation (`saturn new <name>`)
 
-### Creation (`project new <name>`)
+1. `host_dir.mkdir(parents=True, exist_ok=True)`.
+2. If `.saturn/Containerfile` doesn't exist, write the seed template.
+3. Print the path and suggested next command.
 
-1. `ensure_base()` — saturn-base must exist before we can run the chown container.
-2. `ensure_volume(saturn_ws_<name>, <name>, "ws")`.
-3. Print next-step hint.
+No engine calls — the project exists as soon as the directory exists.
 
-Deliberately does **not** write any files into the volume. Users may clone an existing repo into the fresh volume; scaffolding a template would collide with cloned content. See [decisions/0005-lifecycle-vs-content.md](../../decisions/0005-lifecycle-vs-content.md).
+### Removal (`saturn rm <name>`)
 
-### Removal (`project rm <name>`)
-
-1. Confirm by typing the project name.
-2. `docker rm -f saturn_<name>` (project container, if any).
-3. `docker rm -f saturn_bootstrap_<name>` (in case a bootstrap shell was abandoned).
-4. `docker volume rm saturn_ws_<name>`.
-5. `docker rmi localhost/saturn-<name>:latest`.
-
-All four `engine_ok` (non-checking) since any subset may already be absent.
+1. Confirm by typing the project name (skipped with `-f`).
+2. `docker rm -f saturn_<name>` (best-effort).
+3. `docker rmi localhost/saturn-<name>:latest` (best-effort).
+4. `shutil.rmtree(host_dir)`.
 
 ## Execution-context constraints
 
-- Name validation is structural only (no filesystem characters that break paths). It does not check against existing engine-reserved names or docker image-name rules beyond "no uppercase" (docker requires lowercase for image refs) — image names use the lowercased? No, we use the name as-is, so a name like `MyProj` would produce `localhost/saturn-MyProj:latest` which docker rejects. **Known limitation**: names should be lowercase + `[a-z0-9_-]`.
+- Name validation is structural (no filesystem-breaking chars). Docker image refs require lowercase; names like `MyProj` produce `localhost/saturn-MyProj:latest` which docker rejects. **Known limitation**: stick to lowercase + `[a-z0-9_-]`.
+- Running as container-root under rootless userns means `saturn new` inside a container creates the dir with host-user ownership on disk. Same for `rm`'s `rmtree`.
