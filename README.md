@@ -20,6 +20,38 @@ $EDITOR my-base.Dockerfile
 saturn base build my-base.Dockerfile
 ```
 
+### Prebaking tools into the base
+
+Every workspace `.saturn/Dockerfile` seeded by `saturn new --<flag>` inherits from `saturn-base` and re-runs its own `apt install` / `curl | bash` step. Docker's layer cache shares those layers across workspaces that declare identical `RUN` lines, so the second workspace you build with the same flags is near-instant. If you'd rather skip the per-workspace install step entirely — or bake tools not covered by the shipped flags — write your own base Dockerfile, build it once, and point workspaces at it via `SATURN_BASE_IMAGE`.
+
+```dockerfile
+# my-base.Dockerfile
+FROM docker.io/library/debian:trixie-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      docker-cli docker-compose ca-certificates python3 git curl \
+      openssh-client gh \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+COPY saturn /usr/local/bin/saturn
+RUN chmod 0755 /usr/local/bin/saturn
+
+ENV IS_SANDBOX=1
+ENV PATH=/root/.local/bin:${PATH}
+CMD ["sleep", "infinity"]
+```
+
+```sh
+saturn base build my-base.Dockerfile
+export SATURN_BASE_IMAGE=localhost/saturn-base:latest  # or a custom tag
+saturn new ~/code/myproj                               # workspace Dockerfile FROMs your base
+```
+
+When the base already has a tool baked in, skip the matching `saturn new --<flag>` and add the bind-mount line to `.saturn/compose.yaml` by hand — otherwise the workspace Dockerfile duplicates the install step. The flag is a convenience for a minimal base; with a fat base, the compose volume is the only thing you still need.
+
 ## Usage
 
 ### Commands
