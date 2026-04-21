@@ -20,6 +20,16 @@ Commands:
   shell              alias for `saturn exec dev bash`
   <anything else>    forwarded to `docker compose -f .saturn/compose.json -p <ws>`
 
+Compose override chain:
+  Additional compose files merge onto `.saturn/compose.yaml` via docker
+  compose's native `-f base -f override` semantics (later files layer on
+  top — scalars replace, lists append, maps deep-merge). Two sources are
+  picked up automatically:
+    * `.saturn/compose.override*.yaml` in the workspace (sorted)
+    * `SATURN_COMPOSE_OVERRIDES` env var (colon-separated absolute paths)
+  Overrides participate in env substitution and nested bind-mount path
+  translation just like the base file.
+
 Hard deps: `docker` CLI with the `compose` plugin. Point DOCKER_HOST at
 any engine socket (rootless podman's docker-compat socket works).
 """
@@ -124,8 +134,8 @@ _COMPOSE_HEAD = """\
 services:
   dev:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: .saturn/Dockerfile
     image: localhost/saturn-{name}:latest
     container_name: saturn_{name}
     init: true
@@ -357,8 +367,32 @@ def _translate(source: str, mounts: list[dict]) -> str | None:
     return None
 
 
-def _translate_compose(compose_yaml: Path, project: str) -> Path:
+def _find_overrides(ws: Path) -> list[Path]:
+    """Return override compose files to layer onto `.saturn/compose.yaml`.
+
+    Two sources, in order:
+      1) `.saturn/compose.override*.yaml` globbed and sorted lexically.
+         Docker-compose convention generalized (compose itself auto-picks
+         up a single `compose.override.yaml`); we accept any number to
+         let callers stack their own.
+      2) `SATURN_COMPOSE_OVERRIDES` env var, colon-separated absolute
+         paths — the programmatic hook for orchestrators that write
+         transient overrides.
+
+    Returns an empty list when nothing matches.
+    """
+    overrides = sorted((ws / ".saturn").glob("compose.override*.yaml"))
+    env_val = os.environ.get("SATURN_COMPOSE_OVERRIDES", "")
+    overrides += [Path(p).resolve() for p in env_val.split(":") if p]
+    return overrides
+
+
+def _translate_compose(compose_files: list[Path], project: str) -> Path:
     """Run `compose config --format json`, handle guest-mode translation, write compose.json.
+
+    Accepts one or more compose files; docker compose merges them with its
+    native `-f a -f b` semantics (later files overlay earlier ones). The
+    resulting merged spec is what gets nested-path-translated.
 
     Host mode: the spec is written back unchanged after compose resolves it
     (env substitution, relative-path resolution). Safe round-trip.
@@ -374,11 +408,12 @@ def _translate_compose(compose_yaml: Path, project: str) -> Path:
          image here (with the inside-path context) and then strip the
          build: stanza so compose doesn't re-read it.
     """
+    cmd = ["docker", "compose"]
+    for f in compose_files:
+        cmd += ["-f", str(f)]
+    cmd += ["-p", project, "config", "--format", "json"]
     r = _run(
-        "docker", "compose",
-        "-f", str(compose_yaml),
-        "-p", project,
-        "config", "--format", "json",
+        *cmd,
         check=False, capture=True,
     )
     if r.returncode != 0:
@@ -432,7 +467,7 @@ def _translate_compose(compose_yaml: Path, project: str) -> Path:
                   "under an existing mount — workspace, socket, or another mounted path.)"
             )
 
-    out = compose_yaml.parent / "compose.json"
+    out = compose_files[0].parent / "compose.json"
     out.write_text(json.dumps(spec, indent=2))
     return out
 
@@ -440,7 +475,8 @@ def _translate_compose(compose_yaml: Path, project: str) -> Path:
 def passthrough(argv: list[str]) -> None:
     ws = _find_workspace()
     project = _normalize_name(ws.name)
-    compose_json = _translate_compose(ws / ".saturn" / "compose.yaml", project)
+    compose_files = [ws / ".saturn" / "compose.yaml", *_find_overrides(ws)]
+    compose_json = _translate_compose(compose_files, project)
 
     cmd = ["docker", "compose", "-f", str(compose_json), "-p", project, *argv]
     r = subprocess.run(cmd)

@@ -63,15 +63,16 @@ Pure filesystem; no engine calls. Nested `saturn new ./sub` works because the cu
 ### `saturn up -d` (or any pass-through)
 
 1. `ws = _find_workspace()` (walk cwd upward). `project = ws.name`.
-2. `compose_json = _translate_compose(ws/.saturn/compose.yaml, project)`:
-   - Run `docker compose -f compose.yaml -p <project> config --format json` → spec (env-substituted, path-normalized, volumes in long-form).
+2. `files = [ws/.saturn/compose.yaml, *_find_overrides(ws)]` — the committed base plus any `.saturn/compose.override*.yaml` and `SATURN_COMPOSE_OVERRIDES` entries ([decision 0014](decisions/0014-compose-override-chain.md)).
+3. `compose_json = _translate_compose(files, project)`:
+   - Run `docker compose -f f1 -f f2 … -p <project> config --format json` → merged, env-substituted, path-normalized spec with volumes in long-form. Compose does the `-f` merge itself (scalars replace, lists append, maps deep-merge).
    - Host mode: write spec → `compose.json`. Done.
    - Guest mode:
      - For each service with `build:`: `docker build -f <ctx>/<dockerfile> -t <image> <ctx>` — client reads context via inside-path, daemon stores result on host engine. Strip `build:` from the service.
      - Get current container's `.Mounts` via `docker inspect $(gethostname)`.
-     - For each bind-type volume: find the mount whose destination is the longest ancestor of `vol.source`, replace `vol.source` with `mount.Source + rel`. Collect unresolvables; if any → fail-fast.
+     - For each bind-type volume (from base or override — merge already happened): find the mount whose destination is the longest ancestor of `vol.source`, replace `vol.source` with `mount.Source + rel`. Collect unresolvables; if any → fail-fast.
      - Write translated spec → `compose.json`.
-3. `subprocess.run(["docker", "compose", "-f", compose_json, "-p", project, *argv])`. On non-zero exit, print the command that ran before propagating the returncode.
+4. `subprocess.run(["docker", "compose", "-f", compose_json, "-p", project, *argv])`. On non-zero exit, print the command that ran before propagating the returncode.
 
 ### `saturn base default`
 

@@ -12,7 +12,7 @@ Implementation: one Python file, stdlib only. Hard dep on the `docker` CLI with 
 
 ## Sub-documents
 
-- [architecture.md](architecture.md) — Compose as the IR; translate-then-forward as the single saturn-specific step.
+- [architecture.md](architecture.md) — Compose as the IR; translate-then-forward as the single saturn-specific step. Multi-file input (base + overrides) layered via compose's native `-f` chain.
 - [components/cli/](components/cli/index.md) — Small `main()` switch: `new`, `base`, `shell`, pass-through.
 - [components/workspace/](components/workspace/index.md) — The `.saturn/` directory: what `saturn new --<flag>` seeds; how workspaces are discovered (walk cwd upward).
 - [components/base-image/](components/base-image/index.md) — Minimal Debian base with `docker` CLI + compose plugin + `python3`/`git`/`curl`. Tool-specific installs (ssh/gh/node) moved to per-workspace Dockerfiles.
