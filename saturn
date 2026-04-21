@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""saturn: minimal per-project dev container CLI (rootless podman/docker).
+"""saturn: minimal dev-container CLI (rootless podman/docker).
 
-Each project is a host directory at $HOME/saturn/<name>. Saturn bind-mounts
-the projects root and selected mixin paths (subsets of $HOME like ~/.ssh,
-~/.claude.json) path-symmetrically into each container; containers run as
-root, which rootless userns maps back to your host user — so files written
-from inside land on disk with the right ownership.
+A workspace is any directory containing `.saturn/`. `saturn up [dir]`
+bind-mounts that dir at /root/<basename> inside a fresh container; `down`,
+`shell`, and `exec` operate on the container for the current cwd's
+workspace. Containers run as root, which rootless userns maps back to your
+host user — so files written from inside land on disk with host ownership.
 
-Works at any nesting level: SATURN_HOST_HOME and SATURN_HOST_SOCK propagate
-so `saturn` inside a saturn container creates siblings on the host engine.
+Nested `saturn up` works when the target is a subdirectory of the current
+container's workspace: saturn derives the host path by appending the
+relative path to SATURN_HOST_WORKSPACE.
 
 Commands:
   base {template,default,build}
@@ -16,20 +17,22 @@ Commands:
     default  [--mixins <csv>]      (re)build base from inlined default
     build <file>                   (re)build base from a Containerfile (verbatim)
 
-  ls                               list projects
-  new <name>                       create $HOME/saturn/<name> + .saturn/Containerfile
-  rm <name> [-f]                   stop container, remove image, rm host dir
-  up <name>  [--mixins <csv>]      build project image + start container
-  down <name>                      stop+remove container (host dir kept)
-  shell <name>                     interactive shell in project container
-  exec <name> <cmd> [args...]      run command in project container
+  new   [dir]                      create <dir>/.saturn/ + Containerfile (default cwd)
+  up    [dir] [--mixins <csv>] [--mixin-root <dir>]
+                                   build workspace image + start container
+  down                             stop+remove container for cwd's workspace
+  shell                            interactive shell in cwd's container
+  exec <cmd> [args...]             run command in cwd's container
 
 Mixins (user-global state bundles — tool install + bind-mounted paths):
-  Each mixin declares HOME-relative `paths` and a `setup` script. The setup
-  is spliced into the base Containerfile as `RUN <setup>`; the paths are
-  bind-mounted symmetrically (`-v $HOST_HOME/<rel>:$HOST_HOME/<rel>`) on `up`.
-  Missing paths on host cause `up` to fail so the user knows to run
-  `ssh-keygen`, `gh auth login`, etc. first.
+  Each mixin declares a `setup` script plus one or more `slots`. A slot has
+  an `env` (host-path env var), a fixed container `target`, a `kind`
+  (file|dir), and a HOME-relative `default_host` fallback. On `saturn up`
+  each slot is bind-mounted `<host_path>:<target>`. Host mode resolves
+  `host_path` from the env var or falls back to $HOST_HOME/<default_host>,
+  creating missing paths automatically. Guest mode (inside a container,
+  SATURN_IN_GUEST=1) requires the env var to be set; the outer saturn
+  propagates it.
 """
 
 from __future__ import annotations
@@ -74,14 +77,19 @@ CMD ["sleep", "infinity"]
 # ---------- mixins -------------------------------------------------------
 #
 # Each mixin bundles:
-# - `paths`: list of HOME-relative strings. Each resolves to $HOST_HOME/<rel>
-#   and is bind-mounted path-symmetrically (`-v <host>:<host>`) on `up`.
-#   A missing path on host causes `up` to fail fast.
+# - `slots`: list of per-path records. Each slot is bind-mounted as
+#   `<host_path>:<target>` on `up`. `host_path` comes from `env` (a dedicated
+#   env var) or — in host mode only — from $HOST_HOME/<default_host>. `kind`
+#   ("file" | "dir") tells host-mode auto-create how to materialize a
+#   missing path. `target` is the fixed container-side path; the container's
+#   tools expect to find the mount there (e.g. /root/.ssh).
 # - `setup`: shell string spliced into the base Containerfile as `RUN <setup>`
 #   during `base default` / `base template`. Empty means no install step.
 MIXINS: dict[str, dict] = {
     "ssh": {
-        "paths": [".ssh"],
+        "slots": [
+            {"env": "SATURN_MIXIN_SSH", "target": "/root/.ssh", "kind": "dir", "default_host": ".ssh"},
+        ],
         "setup": (
             "apt-get update"
             " && apt-get install -y --no-install-recommends openssh-client"
@@ -89,7 +97,9 @@ MIXINS: dict[str, dict] = {
         ),
     },
     "gh": {
-        "paths": [".config/gh"],
+        "slots": [
+            {"env": "SATURN_MIXIN_GH", "target": "/root/.config/gh", "kind": "dir", "default_host": ".config/gh"},
+        ],
         "setup": (
             "apt-get update"
             " && apt-get install -y --no-install-recommends gh"
@@ -97,7 +107,10 @@ MIXINS: dict[str, dict] = {
         ),
     },
     "claude": {
-        "paths": [".claude", ".claude.json"],
+        "slots": [
+            {"env": "SATURN_MIXIN_CLAUDE", "target": "/root/.claude", "kind": "dir", "default_host": ".claude"},
+            {"env": "SATURN_MIXIN_CLAUDE_JSON", "target": "/root/.claude.json", "kind": "file", "default_host": ".claude.json"},
+        ],
         "setup": (
             "apt-get update"
             " && apt-get install -y --no-install-recommends curl ca-certificates nodejs npm"
@@ -106,7 +119,9 @@ MIXINS: dict[str, dict] = {
         ),
     },
     "codex": {
-        "paths": [".codex"],
+        "slots": [
+            {"env": "SATURN_MIXIN_CODEX", "target": "/root/.codex", "kind": "dir", "default_host": ".codex"},
+        ],
         "setup": (
             "apt-get update"
             " && apt-get install -y --no-install-recommends curl ca-certificates nodejs npm"
@@ -165,6 +180,19 @@ SOCK = os.environ.get("SATURN_SOCK", _default_socket())
 HOST_SOCK = os.environ.get("SATURN_HOST_SOCK", SOCK)
 HOST_HOME = os.environ.get("SATURN_HOST_HOME") or str(Path.home())
 
+# Outer saturn sets SATURN_IN_GUEST=1 when launching a child container, so
+# inside we know to require per-slot env vars (the outer already resolved
+# them) rather than falling back to host-side defaults or creating paths.
+IS_HOST = os.environ.get("SATURN_IN_GUEST") != "1"
+
+# Set by the outer saturn when launching a container. HOST_WORKSPACE is the
+# host-side absolute path of the current container's workspace; WORKSPACE is
+# the container-side absolute path (where the bind-mount lands, e.g.
+# /root/<name>). Inner saturn consumes both to translate a target dir into
+# a host path for nested bind-mounts.
+HOST_WORKSPACE = os.environ.get("SATURN_HOST_WORKSPACE")
+WORKSPACE = os.environ.get("SATURN_WORKSPACE")
+
 os.environ["DOCKER_HOST"] = f"unix://{SOCK}"
 
 # Podman's docker-compat socket doesn't serve BuildKit; force classic builder.
@@ -179,15 +207,6 @@ sys.stdout.reconfigure(line_buffering=True)
 
 def engine(*args: str) -> None:
     subprocess.run(["docker", *args], check=True)
-
-
-def engine_quiet(*args: str) -> None:
-    subprocess.run(
-        ["docker", *args],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=True,
-    )
 
 
 def engine_ok(*args: str) -> bool:
@@ -213,53 +232,73 @@ def engine_exec(*args: str) -> None:
     os.execvp("docker", ["docker", *args])
 
 
-# ---------- project model ------------------------------------------------
-
-SATURN_ROOT = Path(HOST_HOME) / "saturn"
-CONTAINERFILE_REL = ".saturn/Containerfile"
+# ---------- workspace model ----------------------------------------------
 
 CONTAINERFILE_TEMPLATE = (
     "FROM {base}\n"
     "\n"
-    "# Add project tooling here. Example:\n"
+    "# Add workspace tooling here. Example:\n"
     "#   RUN apt-get update \\\n"
     "#    && apt-get install -y --no-install-recommends ripgrep \\\n"
     "#    && rm -rf /var/lib/apt/lists/*\n"
 )
 
 
-class Project:
-    def __init__(self, name: str) -> None:
+class Workspace:
+    """A directory the user targets for `saturn up`.
+
+    `host_path` is the host-absolute path (docker daemon resolves on host, so
+    every `-v <src>:<dst>` source and every `docker build` path uses this).
+    `view_path` is the path visible from this saturn process — equal to
+    `host_path` on the host, a container-side path inside a container.
+    Filesystem checks (is_dir, is_file, mkdir) must use `view_path`.
+    """
+
+    def __init__(self, host_path: Path, view_path: Path) -> None:
+        name = host_path.name
         if not name or "/" in name or name.startswith(".") or " " in name:
-            sys.exit(f"invalid project name: {name!r}")
+            sys.exit(f"invalid workspace basename: {name!r}  (from path {host_path})")
+        self.host_path = host_path
+        self.view_path = view_path
         self.name = name
         self.container = f"saturn_{name}"
         self.image = f"localhost/saturn-{name}:latest"
-        self.host_dir = SATURN_ROOT / name
+        self.container_dir = Path("/root") / name
 
-    def containerfile(self) -> Path:
-        return self.host_dir / CONTAINERFILE_REL
+    def containerfile_view(self) -> Path:
+        return self.view_path / ".saturn" / "Containerfile"
+
+    def containerfile_host(self) -> Path:
+        return self.host_path / ".saturn" / "Containerfile"
 
 
-def project_list() -> list[str]:
-    names: set[str] = set()
-    # Host-side: any dir with a `.saturn/` marker (created by `saturn new`).
-    # Hidden dirs and unrelated subdirs of $HOME/saturn are filtered out.
-    if SATURN_ROOT.is_dir():
-        for child in SATURN_ROOT.iterdir():
-            if child.is_dir() and not child.name.startswith(".") and (child / ".saturn").is_dir():
-                names.add(child.name)
-    out = engine_out(
-        "ps", "-a",
-        "--filter", "label=saturn.project",
-        "--format", "{{index .Labels \"saturn.project\"}}",
-    )
-    if out:
-        for line in out.splitlines():
-            line = line.strip()
-            if line:
-                names.add(line)
-    return sorted(names)
+def _resolve_target(arg: str | None) -> Workspace:
+    """Resolve a CLI target (or cwd) to a Workspace.
+
+    Host mode: `host_path == view_path == resolve(arg or '.')`.
+    Guest mode: the target must be under the current container's workspace
+    (`SATURN_WORKSPACE`); the host path is `SATURN_HOST_WORKSPACE` + the
+    relative path from the current workspace to the target. This makes
+    nested `up` deterministic without needing to mount the host-side
+    projects root.
+    """
+    view = Path(arg if arg is not None else ".").resolve()
+    if not view.is_dir():
+        sys.exit(f"not a directory: {view}")
+    if IS_HOST:
+        return Workspace(host_path=view, view_path=view)
+    if not HOST_WORKSPACE or not WORKSPACE:
+        sys.exit(
+            "SATURN_HOST_WORKSPACE / SATURN_WORKSPACE unset inside container — "
+            "can't derive host path for target"
+        )
+    current = Path(WORKSPACE).resolve()
+    try:
+        rel = view.relative_to(current)
+    except ValueError:
+        sys.exit(f"target must be under current workspace {current}: got {view}")
+    host = Path(HOST_WORKSPACE) / rel
+    return Workspace(host_path=host, view_path=view)
 
 
 # ---------- base image ---------------------------------------------------
@@ -295,51 +334,94 @@ def _interactive_flags() -> list[str]:
     return ["-it"] if sys.stdin.isatty() else ["-i"]
 
 
-def _env_flags() -> list[str]:
-    # SATURN_HOST_SOCK / SATURN_HOST_HOME carry host-side paths so a nested
-    # saturn can reconstruct the right bind-mounts. HOME override makes ~
-    # resolve to $HOST_HOME (where mixin paths are mounted).
-    return [
+def _env_flags(slots: list[dict], workspace: Workspace) -> list[str]:
+    # SATURN_HOST_SOCK / SATURN_HOST_HOME carry host-side paths for nested
+    # saturn. SATURN_HOST_WORKSPACE + SATURN_WORKSPACE are consumed by inner
+    # saturn's _resolve_target to translate a target dir under the current
+    # workspace into a host path. SATURN_IN_GUEST=1 flips inner saturn into
+    # guest mode. Each slot's host-path env var is propagated so inner
+    # saturn re-mounts from the real host path.
+    flags = [
         "-e", f"SATURN_ENGINE={ENGINE}",
         "-e", "SATURN_SOCK=/var/run/docker.sock",
         "-e", f"SATURN_HOST_SOCK={HOST_SOCK}",
         "-e", f"SATURN_HOST_HOME={HOST_HOME}",
-        "-e", f"HOME={HOST_HOME}",
+        "-e", "SATURN_IN_GUEST=1",
+        "-e", f"SATURN_HOST_WORKSPACE={workspace.host_path}",
+        "-e", f"SATURN_WORKSPACE={workspace.container_dir}",
     ]
+    for s in slots:
+        flags += ["-e", f"{s['env']}={s['host_path']}"]
+    return flags
 
 
 def _base_mount_flags() -> list[str]:
-    # The projects root is always mounted path-symmetrically so nested saturn
-    # can read/write any project. The engine socket lets it talk to the host
-    # engine. Nothing else from $HOME comes in automatically — mixins opt-in.
+    # Only the engine socket is always present. The per-project workspace
+    # mount is added in cmd_up (target `/root/<name>`, no path symmetry);
+    # mixin mounts are added per `--mixins` selection. Nothing else from
+    # `$HOME` comes in automatically.
     return [
-        "-v", f"{SATURN_ROOT}:{SATURN_ROOT}",
         "-v", f"{HOST_SOCK}:/var/run/docker.sock",
     ]
 
 
-def _mixin_paths(names: list[str]) -> list[tuple[str, str]]:
-    """Return (mixin-name, absolute-host-path) pairs for each path in each mixin."""
-    return [(n, f"{HOST_HOME}/{rel}") for n in names for rel in MIXINS[n]["paths"]]
+def _resolve_mixin_slots(names: list[str], mixin_root: str | None = None) -> list[dict]:
+    """Return a resolved slot record per slot across the selected mixins.
+
+    Each record carries {mixin, env, target, kind, host_path}. In guest mode,
+    `env` must be set — otherwise we exit with a labelled list. In host mode,
+    a missing `env` falls back to `<mixin_root>/<default_host>` (or
+    `$HOST_HOME/<default_host>` when `mixin_root` is None). Per-slot env var
+    overrides still win; `mixin_root` only shifts the default provider.
+    """
+    root = mixin_root if mixin_root is not None else HOST_HOME
+    out: list[dict] = []
+    missing_env: list[tuple[str, str]] = []
+    for n in names:
+        for s in MIXINS[n]["slots"]:
+            host_path = os.environ.get(s["env"])
+            if host_path is None:
+                if IS_HOST:
+                    host_path = f"{root}/{s['default_host']}"
+                else:
+                    missing_env.append((n, s["env"]))
+                    continue
+            out.append({
+                "mixin": n,
+                "env": s["env"],
+                "target": s["target"],
+                "kind": s["kind"],
+                "host_path": host_path,
+            })
+    if missing_env:
+        lines = [f"  {n}: {e}" for (n, e) in missing_env]
+        sys.exit(
+            "mixin env var(s) unset inside container:\n"
+            + "\n".join(lines)
+            + "\nThe outer saturn should have propagated these. Re-run the "
+              "outer `saturn up` with the mixin enabled, or drop it from --mixins."
+        )
+    return out
 
 
-def _check_mixin_paths(names: list[str]) -> None:
-    missing = [(n, p) for (n, p) in _mixin_paths(names) if not Path(p).exists()]
-    if not missing:
-        return
-    lines = [f"  {n}: {p}" for (n, p) in missing]
-    sys.exit(
-        "mixin path(s) missing on host:\n"
-        + "\n".join(lines)
-        + "\nCreate them (ssh-keygen, gh auth login, claude login, ...) "
-          "or drop the mixin from --mixins."
-    )
+def _ensure_mixin_host_paths(slots: list[dict]) -> None:
+    """Host-mode: materialize any missing slot host paths (file or dir)."""
+    for s in slots:
+        p = Path(s["host_path"])
+        if p.exists():
+            continue
+        if s["kind"] == "dir":
+            p.mkdir(parents=True, exist_ok=True)
+        else:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.touch()
+        print(f"created {s['kind']}: {p}  (mixin: {s['mixin']})")
 
 
-def _mixin_mount_flags(names: list[str]) -> list[str]:
+def _mixin_mount_flags(slots: list[dict]) -> list[str]:
     args: list[str] = []
-    for _, p in _mixin_paths(names):
-        args += ["-v", f"{p}:{p}"]
+    for s in slots:
+        args += ["-v", f"{s['host_path']}:{s['target']}"]
     return args
 
 
@@ -369,116 +451,85 @@ def cmd_base_build(args: argparse.Namespace) -> None:
     print(f"base ready: {BASE_IMAGE}")
 
 
-# ---------- commands: project lifecycle ---------------------------------
-
-def cmd_ls(_args: argparse.Namespace) -> None:
-    for n in project_list():
-        print(n)
-
+# ---------- commands: workspace lifecycle -------------------------------
 
 def cmd_new(args: argparse.Namespace) -> None:
-    p = Project(args.name)
-    p.host_dir.mkdir(parents=True, exist_ok=True)
-    cf = p.containerfile()
-    if not cf.exists():
-        cf.parent.mkdir(parents=True, exist_ok=True)
-        cf.write_text(CONTAINERFILE_TEMPLATE.format(base=BASE_IMAGE))
-        seeded = True
-    else:
-        seeded = False
-    print(f"created: {p.host_dir}")
+    raw = getattr(args, "target", None)
+    view = Path(raw if raw is not None else ".").resolve()
+    view.mkdir(parents=True, exist_ok=True)
+    ws = _resolve_target(str(view))
+    saturn_dir = ws.view_path / ".saturn"
+    saturn_dir.mkdir(parents=True, exist_ok=True)
+    cf = saturn_dir / "Containerfile"
+    seeded = not cf.exists()
     if seeded:
-        print(f"seeded:  {cf}")
-    print(f"  next: $EDITOR {cf} && saturn up {p.name}")
+        cf.write_text(CONTAINERFILE_TEMPLATE.format(base=BASE_IMAGE))
+    print(f"workspace: {ws.view_path}")
+    if seeded:
+        print(f"seeded:    {cf}")
+    print(f"  next: $EDITOR {cf} && saturn up {ws.view_path}")
 
-
-def cmd_rm(args: argparse.Namespace) -> None:
-    p = Project(args.name)
-    has_dir = p.host_dir.exists()
-    has_container = container_status(p.container) != ""
-    if not has_dir and not has_container:
-        sys.exit(f"no such project: {p.name}")
-    if not args.force:
-        prompt = (
-            f"remove container {p.container}, image {p.image}, "
-            f"and directory {p.host_dir}?\n"
-            f"type project name ({p.name}) to confirm: "
-        )
-        try:
-            ans = input(prompt)
-        except EOFError:
-            ans = ""
-        if ans != p.name:
-            sys.exit("aborted")
-    engine_ok("rm", "-f", p.container)
-    engine_ok("rmi", p.image)
-    if has_dir:
-        shutil.rmtree(p.host_dir)
-    print(f"removed: {p.name}")
-
-
-# ---------- commands: up/down/shell/exec --------------------------------
 
 def cmd_up(args: argparse.Namespace) -> None:
-    p = Project(args.name)
-    if not p.host_dir.is_dir():
-        sys.exit(f"no such project: {p.name}"
-                 f"  (try: saturn new {p.name})")
-    mixins = _cli_mixins(getattr(args, "mixins", None))
-    _check_mixin_paths(mixins)
+    ws = _resolve_target(getattr(args, "target", None))
     check_socket()
+
+    status = container_status(ws.container)
+    if status == "running":
+        print(f"already up: {ws.container}  (down && up to pick up image changes)")
+        return
+
+    mixins = _cli_mixins(getattr(args, "mixins", None))
+    mixin_root = getattr(args, "mixin_root", None) if IS_HOST else None
+    slots = _resolve_mixin_slots(mixins, mixin_root)
+    if IS_HOST:
+        _ensure_mixin_host_paths(slots)
     ensure_base()
 
-    cf = p.containerfile()
-    if cf.is_file():
-        print(f"building {p.image} from {p.host_dir}...")
-        engine("build", "-f", str(cf), "-t", p.image, str(p.host_dir))
-        image = p.image
+    cf_view = ws.containerfile_view()
+    if cf_view.is_file():
+        print(f"building {ws.image} from {ws.host_path}...")
+        engine("build", "-f", str(ws.containerfile_host()), "-t", ws.image, str(ws.host_path))
+        image = ws.image
     else:
-        print(f"no {CONTAINERFILE_REL}, using {BASE_IMAGE}")
+        print(f"no .saturn/Containerfile, using {BASE_IMAGE}")
         image = BASE_IMAGE
 
-    status = container_status(p.container)
-    if status == "running":
-        print(f"already up: {p.container}"
-              "  (down && up to pick up image changes)")
-        return
     if status:
-        engine_ok("rm", "-f", p.container)
+        engine_ok("rm", "-f", ws.container)
 
-    engine_quiet(
-        "run", "-d", "--init", "--name", p.container,
-        "--label", f"saturn.project={p.name}",
+    engine(
+        "run", "-d", "--init", "--name", ws.container,
+        "--label", f"saturn.workspace={ws.host_path}",
         *_base_mount_flags(),
-        *_mixin_mount_flags(mixins),
-        *_env_flags(),
-        "-w", str(p.host_dir),
+        "-v", f"{ws.host_path}:{ws.container_dir}",
+        *_mixin_mount_flags(slots),
+        *_env_flags(slots, ws),
+        "-w", str(ws.container_dir),
         image,
     )
     note = f"  (mixins: {', '.join(mixins)})" if mixins else ""
-    print(f"up: {p.container}{note}")
+    print(f"up: {ws.container}{note}")
 
 
-def cmd_down(args: argparse.Namespace) -> None:
-    p = Project(args.name)
-    engine_ok("rm", "-f", p.container)
-    print(f"down: {p.container}")
+def cmd_down(_args: argparse.Namespace) -> None:
+    ws = _resolve_target(None)
+    engine_ok("rm", "-f", ws.container)
+    print(f"down: {ws.container}")
 
 
-def cmd_shell(args: argparse.Namespace) -> None:
-    p = Project(args.name)
-    if container_status(p.container) != "running":
-        sys.exit(f"container not running: {p.container}"
-                 f"  (try: saturn up {p.name})")
-    engine_exec("exec", *_interactive_flags(), p.container, "/bin/bash")
+def cmd_shell(_args: argparse.Namespace) -> None:
+    ws = _resolve_target(None)
+    if container_status(ws.container) != "running":
+        sys.exit(f"container not running: {ws.container}  (try: saturn up)")
+    engine_exec("exec", *_interactive_flags(), ws.container, "/bin/bash")
 
 
 def cmd_exec(args: argparse.Namespace) -> None:
-    p = Project(args.name)
-    if container_status(p.container) != "running":
-        sys.exit(f"container not running: {p.container}"
-                 f"  (try: saturn up {p.name})")
-    engine_exec("exec", *_interactive_flags(), p.container, *args.cmd)
+    ws = _resolve_target(None)
+    if container_status(ws.container) != "running":
+        sys.exit(f"container not running: {ws.container}  (try: saturn up)")
+    engine_exec("exec", *_interactive_flags(), ws.container, *args.cmd)
 
 
 # ---------- dispatch ----------------------------------------------------
@@ -494,9 +545,9 @@ def _mixins_help() -> str:
 def main() -> None:
     # Intercept `exec` before argparse so flags in the user's command survive.
     if len(sys.argv) >= 2 and sys.argv[1] == "exec":
-        if len(sys.argv) < 4:
-            sys.exit("usage: saturn exec <name> <cmd> [args...]")
-        ns = argparse.Namespace(name=sys.argv[2], cmd=sys.argv[3:])
+        if len(sys.argv) < 3:
+            sys.exit("usage: saturn exec <cmd> [args...]")
+        ns = argparse.Namespace(cmd=sys.argv[2:])
         cmd_exec(ns)
         return
 
@@ -506,11 +557,15 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "env vars:\n"
-            "  SATURN_ENGINE       podman|docker -- host engine family (default podman)\n"
-            "  SATURN_SOCK         socket path (DOCKER_HOST is derived from this)\n"
-            "  SATURN_HOST_SOCK    host-side socket path for nested bind-mounts\n"
-            "  SATURN_HOST_HOME    host-side $HOME for nested bind-mounts\n"
-            "  SATURN_BASE_IMAGE   default: localhost/saturn-base:latest\n"
+            "  SATURN_ENGINE          podman|docker -- host engine family (default podman)\n"
+            "  SATURN_SOCK            socket path (DOCKER_HOST is derived from this)\n"
+            "  SATURN_HOST_SOCK       host-side socket path for nested bind-mounts\n"
+            "  SATURN_HOST_HOME       host-side $HOME (used for mixin defaults)\n"
+            "  SATURN_HOST_WORKSPACE  host-side path of the current workspace (set by outer saturn)\n"
+            "  SATURN_WORKSPACE       container-side path of the current workspace (set by outer saturn)\n"
+            "  SATURN_IN_GUEST        set by outer saturn; presence => inside a container\n"
+            "  SATURN_MIXIN_<SLOT>    host-side path for a mixin slot (overrides default)\n"
+            "  SATURN_BASE_IMAGE      default: localhost/saturn-base:latest\n"
         ),
     )
     sub = parser.add_subparsers(dest="command")
@@ -530,33 +585,28 @@ def main() -> None:
     )
     bb.set_defaults(fn=cmd_base_build)
 
-    sub.add_parser("ls", help="list projects").set_defaults(fn=cmd_ls)
-
-    p_new = sub.add_parser("new", help="create $HOME/saturn/<name> + .saturn/Containerfile")
-    p_new.add_argument("name")
+    p_new = sub.add_parser("new", help="create <dir>/.saturn/ + Containerfile (default cwd)")
+    p_new.add_argument("target", nargs="?", default=None,
+                       help="target directory (default: cwd)")
     p_new.set_defaults(fn=cmd_new)
 
-    p_rm = sub.add_parser("rm", help="stop container, remove image, rm host dir")
-    p_rm.add_argument("name")
-    p_rm.add_argument("-f", "--force", action="store_true",
-                      help="skip confirmation prompt")
-    p_rm.set_defaults(fn=cmd_rm)
-
-    p_up = sub.add_parser("up", help="build project image + start container")
-    p_up.add_argument("name")
+    p_up = sub.add_parser("up", help="build workspace image + start container")
+    p_up.add_argument("target", nargs="?", default=None,
+                      help="target directory (default: cwd)")
     p_up.add_argument("--mixins", default=None, help=_mixins_help())
+    p_up.add_argument(
+        "--mixin-root",
+        default=None,
+        help="host directory to resolve mixin default paths under "
+             "(instead of $HOST_HOME); host mode only; per-slot "
+             "SATURN_MIXIN_* env vars still override",
+    )
     p_up.set_defaults(fn=cmd_up)
 
-    p_down = sub.add_parser("down", help="stop+remove container (host dir kept)")
-    p_down.add_argument("name")
-    p_down.set_defaults(fn=cmd_down)
+    sub.add_parser("down", help="stop+remove container for cwd's workspace").set_defaults(fn=cmd_down)
+    sub.add_parser("shell", help="interactive shell in cwd's container").set_defaults(fn=cmd_shell)
 
-    p_shell = sub.add_parser("shell", help="interactive shell in project container")
-    p_shell.add_argument("name")
-    p_shell.set_defaults(fn=cmd_shell)
-
-    p_exec = sub.add_parser("exec", help="run command in project container")
-    p_exec.add_argument("name")
+    p_exec = sub.add_parser("exec", help="run command in cwd's container")
     p_exec.add_argument("cmd", nargs=argparse.REMAINDER)
     p_exec.set_defaults(fn=cmd_exec)
 

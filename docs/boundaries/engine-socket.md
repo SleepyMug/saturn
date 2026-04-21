@@ -45,6 +45,6 @@ Unix domain socket carrying the Docker Engine HTTP API (used by both docker and 
 
 ## Security note
 
-Bind-mounting this socket grants full control of your engine to the container — privileged sibling with `/` mounted is possible. Saturn additionally bind-mounts the projects root (`$HOME/saturn/`) and each selected mixin's paths (credentials like SSH keys and API tokens) path-symmetrically. This is a meaningful blast radius; acceptable for a personal dev tool, not acceptable for untrusted code.
+Bind-mounting this socket grants full control of your engine to the container — privileged sibling with `/` mounted is possible. Saturn additionally bind-mounts the current workspace dir at `/root/<name>` (wherever it lives on the host) and each selected mixin slot's host path at the slot's fixed container target (e.g. `/root/.ssh`). Only the current workspace is mounted — nothing else from `$HOME` or elsewhere. This is a meaningful blast radius; acceptable for a personal dev tool, not acceptable for untrusted code.
 
 `IS_SANDBOX=1` in the base image tells tools like Claude Code that running as root is intentional — it is not an actual sandbox.

@@ -4,7 +4,7 @@
 
 ## Overview
 
-saturn is argparse-driven. `main()` assembles a tree of subparsers, parses `sys.argv`, and dispatches to a `cmd_*` function via `args.fn(args)`. One special case: `saturn exec <name> <cmd...>` must preserve arbitrary flags in `<cmd...>` (e.g. `saturn exec demo ls -la`), so `main()` intercepts `sys.argv[1] == "exec"` before argparse runs.
+saturn is argparse-driven. `main()` assembles a tree of subparsers, parses `sys.argv`, and dispatches to a `cmd_*` function via `args.fn(args)`. One special case: `saturn exec <cmd...>` must preserve arbitrary flags in `<cmd...>` (e.g. `saturn exec ls -la`), so `main()` intercepts `sys.argv[1] == "exec"` before argparse runs.
 
 ## Provided APIs
 
@@ -12,24 +12,22 @@ saturn is argparse-driven. `main()` assembles a tree of subparsers, parses `sys.
 
 Entry point when the script is invoked directly.
 
-- Reads `sys.argv`; if `sys.argv[1] == "exec"`, runs `cmd_exec(Namespace(name=sys.argv[2], cmd=sys.argv[3:]))` and returns before argparse parses anything.
+- Reads `sys.argv`; if `sys.argv[1] == "exec"`, runs `cmd_exec(Namespace(cmd=sys.argv[2:]))` and returns before argparse parses anything.
 - Otherwise builds the argparse tree and parses normally.
 - If no `fn` attribute is set (user typed `saturn` or `saturn base` with no subcommand), prints help.
 - Propagates `KeyboardInterrupt` as exit 130 and `subprocess.CalledProcessError` with the child's exit code.
 
 ### Command surface
 
-All commands live at top level — there is no `project` or `runtime` group.
+All commands live at top level — there is no `project` or `workspace` group.
 
 | Command | Handler | Semantics |
 |---|---|---|
-| `ls` | `cmd_ls` | List projects — union of subdirs of `$HOST_HOME/saturn/` and containers labelled `saturn.project`. |
-| `new <name>` | `cmd_new` | `mkdir -p $HOST_HOME/saturn/<name>` and seed `.saturn/Containerfile` if absent. No engine calls. |
-| `rm <name> [-f]` | `cmd_rm` | Remove container (`saturn_<name>`), image (`localhost/saturn-<name>:latest`), and the host directory. Confirms by typing project name unless `-f`. |
-| `up <name> [--mixins <csv>]` | `cmd_up` | Build project image from `.saturn/Containerfile` (if present; else use base image), then create+run `saturn_<name>`. `--mixins` bind-mounts each selected mixin's paths path-symmetrically; defaults to `DEFAULT_MIXINS` when omitted; `--mixins ''` opts out. Fails fast if any selected mixin's path is missing on host. No-op if already running. |
-| `down <name>` | `cmd_down` | `docker rm -f saturn_<name>`. Idempotent. Host dir kept. |
-| `shell <name>` | `cmd_shell` | `docker exec -it saturn_<name> /bin/bash`; errors if container isn't running. |
-| `exec <name> <cmd...>` | `cmd_exec` | `docker exec -it saturn_<name> <cmd...>`; errors if container isn't running. |
+| `new [dir]` | `cmd_new` | `mkdir -p <dir>` (default cwd), then `mkdir -p <dir>/.saturn` and seed `.saturn/Containerfile` if absent. No engine calls. |
+| `up [dir] [--mixins <csv>] [--mixin-root <dir>]` | `cmd_up` | Resolve `<dir>` (default cwd) to a `Workspace`. Check socket. If container already running → no-op. Otherwise: resolve+auto-create mixin slots, `ensure_base`, build workspace image from `<dir>/.saturn/Containerfile` (if present), tear down any stopped `saturn_<name>`, `docker run` with the workspace bind-mounted at `/root/<name>`. `--mixins` selects mixin bundles (default `DEFAULT_MIXINS`; `--mixins ''` opts out). `--mixin-root` (host mode) re-roots mixin default paths. |
+| `down` | `cmd_down` | `docker rm -f saturn_<name>` where `<name>` = cwd workspace basename. Idempotent. |
+| `shell` | `cmd_shell` | `docker exec -it saturn_<name> /bin/bash` for cwd's workspace; errors if container isn't running. |
+| `exec <cmd...>` | `cmd_exec` | `docker exec -it saturn_<name> <cmd...>` for cwd's workspace; errors if container isn't running. |
 
 `base` group (saturn-base image lifecycle):
 
@@ -41,12 +39,11 @@ All commands live at top level — there is no `project` or `runtime` group.
 
 ## Consumed APIs
 
-- [`Project(name)`](../project/index.md#provided-apis) — construct resource-name bundle from a single name.
-- [`project_list()`](../project/index.md#provided-apis) — discovery.
+- [`Workspace`, `_resolve_target`](../workspace/index.md#provided-apis) — target → Workspace resolution; single point of consumption for `SATURN_HOST_WORKSPACE` / `SATURN_WORKSPACE`.
 - [`ensure_base()`, `_build_base()`](../base-image/index.md#provided-apis) — saturn-base availability.
-- [engine wrappers (`engine`, `engine_ok`, `engine_quiet`, `engine_out`, `engine_exec`)](../engine/index.md#provided-apis) — subprocess to docker CLI.
+- [engine wrappers (`engine`, `engine_ok`, `engine_out`, `engine_exec`)](../engine/index.md#provided-apis) — subprocess to docker CLI.
 - [runtime helpers (`check_socket`, `container_status`, `_interactive_flags`, `_env_flags`, `_base_mount_flags`)](../engine/index.md#provided-apis).
-- [mixin helpers (`MIXINS`, `_cli_mixins`, `_render_base_containerfile`, `_check_mixin_paths`, `_mixin_mount_flags`)](../mixins/index.md#provided-apis).
+- [mixin helpers (`MIXINS`, `_cli_mixins`, `_render_base_containerfile`, `_resolve_mixin_slots`, `_ensure_mixin_host_paths`, `_mixin_mount_flags`)](../mixins/index.md#provided-apis).
 
 ## Workflows
 
@@ -58,7 +55,7 @@ All commands live at top level — there is no `project` or `runtime` group.
 
 ### Interactive I/O
 
-`_interactive_flags()` returns `["-it"]` if stdin is a TTY, else `["-i"]`. The docker CLI rejects `-t` without a TTY, so unguarded use breaks piped invocations (`saturn exec demo ls | head`).
+`_interactive_flags()` returns `["-it"]` if stdin is a TTY, else `["-i"]`. The docker CLI rejects `-t` without a TTY, so unguarded use breaks piped invocations (`saturn exec ls | head`).
 
 ### stdout line buffering
 
@@ -68,3 +65,4 @@ All commands live at top level — there is no `project` or `runtime` group.
 
 - No third-party deps. argparse + subprocess + pathlib + shutil + tempfile + os/sys only.
 - `os.execvp` is used for interactive commands (`shell`, `exec`) so saturn exits and the child process takes over; errors after that point won't be caught.
+- `down`, `shell`, `exec` take no positional args — they derive the workspace from cwd. To operate on a different workspace, `cd` there first.

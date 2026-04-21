@@ -1,6 +1,8 @@
 # 0008 — Mixins as targeted host bind-mounts, not named volumes
 
 > Partially revises [0007](0007-drop-agent-user-use-is-sandbox.md). The `agent` user and sudo stay gone, path symmetry stays, but the whole-`$HOME` bind-mount is replaced by selective mixin paths + an always-mounted projects root. Supersedes [0006](0006-user-state-mixins.md)'s volume-based mixins with bind-mount mixins.
+>
+> **Partially revised by [0009](0009-explicit-host-path-env-vars.md).** Path symmetry for mixin mounts is dropped in favor of per-slot (env var → fixed container target) records. Projects-root symmetry stays. Fail-fast on missing host paths is replaced by host-mode auto-create; guest mode keeps strict semantics.
 
 ## Context
 

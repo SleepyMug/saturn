@@ -1,10 +1,10 @@
 # Architecture
 
-> One Python file. Logical components communicate through small helpers; all state lives in engine objects + host directories under `$HOME/saturn/`.
+> One Python file. Logical components communicate through small helpers; saturn owns no state of its own.
 
 ## Overview
 
-saturn is a thin orchestrator over the `docker` CLI. It owns no state of its own: project identity comes from the host directory `$HOME/saturn/<name>/`; container and image identity comes from deterministic naming. The script is one file on disk, distributed as-is (`curl | chmod +x`), and the base image embeds a copy of the same script at `/usr/local/bin/saturn` so nesting is just running saturn again.
+saturn is a thin orchestrator over the `docker` CLI. A *workspace* is any directory containing a `.saturn/` marker — saturn doesn't keep a registry or a fixed root for them. Container and image identity are derived from the workspace's basename. The script is one file on disk, distributed as-is (`curl | chmod +x`), and the base image embeds a copy of the same script at `/usr/local/bin/saturn` so nesting is just running saturn again.
 
 ## Logical layering
 
@@ -14,61 +14,68 @@ saturn is a thin orchestrator over the `docker` CLI. It owns no state of its own
 └───────┬──────────┬──────────┬──────────┬───────────────────┘
         │          │          │          │
         ▼          ▼          ▼          ▼
-   ┌─────────┐ ┌─────────┐ ┌────────┐ ┌────────────┐
-   │ project │ │   base  │ │ mixins │ │  runtime   │
-   │  model  │ │  image  │ │        │ │  helpers   │
-   └────┬────┘ └────┬────┘ └────┬───┘ └─────┬──────┘
-        │           │           │           │
-        └───────────┴─────┬─────┴───────────┘
-                          ▼
-                  ┌───────────────┐
-                  │  engine ops   │
-                  │ (subprocess)  │
-                  └───────────────┘
-                          │
-                          ▼
-              DOCKER_HOST → host engine socket
+   ┌──────────┐ ┌─────────┐ ┌────────┐ ┌────────────┐
+   │workspace │ │  base   │ │ mixins │ │  runtime   │
+   │  model   │ │  image  │ │        │ │  helpers   │
+   └────┬─────┘ └────┬────┘ └────┬───┘ └─────┬──────┘
+        │            │           │           │
+        └────────────┴─────┬─────┴───────────┘
+                           ▼
+                   ┌───────────────┐
+                   │  engine ops   │
+                   │ (subprocess)  │
+                   └───────────────┘
+                           │
+                           ▼
+               DOCKER_HOST → host engine socket
 ```
 
-- **cli** ([components/cli](components/cli/index.md)) — argparse subparser tree and a `sys.argv` intercept so `saturn exec <name> <cmd...>` doesn't have its flags consumed by argparse.
-- **project model** ([components/project](components/project/index.md)) — the `Project` class derives resource names (`saturn_<name>`, `localhost/saturn-<name>:latest`, `$HOST_HOME/saturn/<name>`) from a single `<name>`. `project_list()` unions directory children of `$HOST_HOME/saturn/` with containers labelled `saturn.project`.
+- **cli** ([components/cli](components/cli/index.md)) — argparse subparser tree and a `sys.argv` intercept so `saturn exec <cmd...>` doesn't have its flags consumed by argparse.
+- **workspace model** ([components/workspace](components/workspace/index.md)) — the `Workspace` class bundles `(host_path, view_path, name, container, image, container_dir)` derived from a target directory. `_resolve_target(arg)` turns a CLI target (or cwd) into a `Workspace`, consuming `SATURN_HOST_WORKSPACE` / `SATURN_WORKSPACE` inside a container to compute the host path from the target's relative position under the current workspace.
 - **base image** ([components/base-image](components/base-image/index.md)) — the saturn-base image is built from a HEAD + TAIL inlined Containerfile with mixin `RUN` lines spliced between. At build time, a temp dir is assembled containing the rendered Containerfile + a copy of the running saturn script (for the `COPY saturn` step).
-- **mixins** ([components/mixins](components/mixins/index.md)) — inlined registry of (HOME-relative paths + setup snippet) bundles. Used by `base template`/`default` (splice setup lines) and `up` (bind-mount selected paths at `$HOST_HOME/<rel>`).
-- **runtime helpers** — `ensure_base()`, `check_socket()`, `container_status()`, plus `_env_flags()` / `_base_mount_flags()` / `_mixin_mount_flags()` / `_check_mixin_paths()` for launching new containers.
+- **mixins** ([components/mixins](components/mixins/index.md)) — inlined registry of (slot records + setup snippet) bundles. Each slot has `env`/`target`/`kind`/`default_host`. Used by `base template`/`default` (splice setup lines) and `up` (bind-mount each slot as `<host_path>:<target>`, with `host_path` resolved per-slot from env var or host-mode default).
+- **runtime helpers** — `ensure_base()`, `check_socket()`, `container_status()`, plus `_env_flags(slots, workspace)` / `_base_mount_flags()` / `_mixin_mount_flags(slots)` / `_resolve_mixin_slots()` / `_ensure_mixin_host_paths()` for launching new containers.
 - **engine ops** ([components/engine](components/engine/index.md)) — every engine call is `docker <args>` (no sudo, never `podman`). The docker CLI speaks both engines' docker-compat API.
 
 ## Key data flows
 
-### `saturn new <name>`
+### `saturn new [dir]`
 
-1. `mkdir -p $HOST_HOME/saturn/<name>`.
-2. If `.saturn/Containerfile` doesn't exist, seed it with the inlined template (`FROM localhost/saturn-base:latest` + a commented RUN example).
-3. Print next-step hint.
+1. `mkdir -p <dir>` (default cwd).
+2. Build a `Workspace` via `_resolve_target`.
+3. `mkdir -p <dir>/.saturn`; if `.saturn/Containerfile` is absent, seed it from the inlined template.
 
-No engine calls — this is a pure host-filesystem operation. Works identically on host or inside a saturn container (the bind-mount of `$HOST_HOME` makes the new directory visible on both sides).
+No engine calls — pure filesystem. Works on host or inside a saturn container (for subdirs of the current workspace, since those are under the bind-mount).
 
-### `saturn up <name> [--mixins <csv>]` — build + launch
+### `saturn up [dir] [--mixins <csv>] [--mixin-root <dir>]` — build + launch
 
-1. Resolve mixins (`_cli_mixins` → defaults when flag omitted); `_check_mixin_paths` verifies every selected mixin path exists on the host, else exits.
-2. Verify `$HOST_HOME/saturn/<name>/` exists; `check_socket()`; `ensure_base()` (build saturn-base if missing).
-3. If `.saturn/Containerfile` is present: `docker build -f $HOST_HOME/saturn/<name>/.saturn/Containerfile -t localhost/saturn-<name>:latest $HOST_HOME/saturn/<name>`. Otherwise run directly from the base image.
-4. Start the container: `docker run -d --init --name saturn_<name> --label saturn.project=<name> -v $HOST_HOME/saturn:$HOST_HOME/saturn -v $HOST_SOCK:/var/run/docker.sock <mixin -v pairs> -e SATURN_*=... -e HOME=$HOST_HOME -w $HOST_HOME/saturn/<name> <image>`.
+1. `ws = _resolve_target(dir)`. Host: `host_path == view_path == resolve(dir)`. Guest: requires `dir` to be under `SATURN_WORKSPACE`; host path is `SATURN_HOST_WORKSPACE + rel`.
+2. `check_socket()`.
+3. Short-circuit: if `saturn_<name>` is already running, print "already up" and return.
+4. Resolve mixin slots (`_resolve_mixin_slots(names, mixin_root)`). Host-mode auto-creates missing slot paths (`_ensure_mixin_host_paths`).
+5. `ensure_base()` — build saturn-base if missing.
+6. If `<view_path>/.saturn/Containerfile` exists: `docker build -f <host_path>/.saturn/Containerfile -t localhost/saturn-<name>:latest <host_path>`. Otherwise run directly from the base image.
+7. If a stopped `saturn_<name>` exists, `docker rm -f` it.
+8. Start the container: `docker run -d --init --name saturn_<name> --label saturn.workspace=<host_path> -v $HOST_SOCK:/var/run/docker.sock -v <host_path>:/root/<name> <one "-v <host_path>:<target>" per slot> -e SATURN_ENGINE=... -e SATURN_SOCK=/var/run/docker.sock -e SATURN_HOST_SOCK=... -e SATURN_HOST_HOME=... -e SATURN_HOST_WORKSPACE=<host_path> -e SATURN_WORKSPACE=/root/<name> -e SATURN_IN_GUEST=1 <one "-e <slot.env>=<host_path>" per slot> -w /root/<name> <image>`.
 
-### `saturn exec <name> <cmd...>` — in the project container
+### `saturn exec <cmd...>` — in cwd's container
 
-1. Verify container is running (`container_status`).
-2. `os.execvp("docker", ["exec", "-it", "saturn_<name>", *cmd])` — saturn exits, the user's command takes over.
+1. Resolve cwd's workspace → derive `saturn_<name>`.
+2. Verify container is running (`container_status`).
+3. `os.execvp("docker", ["exec", "-it", "saturn_<name>", *cmd])` — saturn exits, the user's command takes over.
 
 ### Nesting
 
-Inside a saturn container:
+Inside a saturn container (`IS_HOST=False`):
 
 - `DOCKER_HOST=unix:///var/run/docker.sock` points at the bind-mounted host socket.
 - `SATURN_HOST_SOCK` holds the host-side socket path; used as the bind-mount *source* when inner saturn spawns siblings.
-- `SATURN_HOST_HOME` holds the host-side `$HOME`; used both as the base for the projects-root mount (`$SATURN_HOST_HOME/saturn`) and for each mixin path (`$SATURN_HOST_HOME/<rel>`) when a sibling is launched.
-- `HOME` is set to `$SATURN_HOST_HOME` so `~/.ssh`, `~/.claude.json`, etc. resolve to the bind-mounted host paths automatically — **provided** the relevant mixin is mounted both in the outer and inner invocation (the existence check runs against the inside view).
+- `SATURN_HOST_HOME` holds the host-side `$HOME`; used as the prefix for mixin default fallbacks (moot in guest mode).
+- `SATURN_HOST_WORKSPACE` + `SATURN_WORKSPACE` are a pair: the former is the host-side path of the current container's workspace, the latter is the container-side path (e.g. `/root/<name>`). Inner `_resolve_target` consumes both to translate any target dir (under the current workspace) into a host path for sibling bind-mounts.
+- `SATURN_IN_GUEST=1` puts inner saturn in guest mode: per-slot mixin env vars are required (no defaults, no auto-create) and targets outside the current workspace exit fail-fast.
+- Each selected mixin's `SATURN_MIXIN_<SLOT>` holds the host-side path; inner saturn reads it directly and uses it as the bind-mount source for a sibling. Container `HOME` stays `/root`; the workspace lives at `/root/<name>` and mixin targets at `/root/.<tool>`.
 
-From saturn's perspective, inside-operations look identical to host; containers it creates are host-engine siblings of its own container.
+From saturn's perspective, inside-operations talk to the host engine via the socket. Cross-workspace operations (`new` / `up` for a path outside the current workspace) are rejected fail-fast.
 
 ## Execution-context constraints
 
