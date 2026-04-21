@@ -234,7 +234,7 @@ saturn up -d
 
 ## Naming
 
-Container name: `saturn_<basename>`. Image name: `localhost/saturn-<basename>:latest`. Compose project name: `<basename>`. Two workspaces with the same basename collide at `up` time (docker's "container name in use"). Rename a directory to disambiguate.
+Container name: `saturn_<basename>`. Image name: `localhost/saturn-<basename>:latest`. Compose project name: `<basename>`. `<basename>` is the dir's final path component normalized to the compose project-name regex (`^[a-z0-9][a-z0-9_-]*$`): lowercased, with any other char replaced by `-`. So `/home/user/MyProj` → `myproj`; `~/code/weird.name @2` → `weird-name-2`. The dir on disk keeps its original name; saturn prints a note whenever normalization changes anything. Two workspaces that normalize to the same basename collide at `up` time (docker's "container name in use") — rename a dir to disambiguate.
 
 ## Security note
 

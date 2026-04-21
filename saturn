@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -169,14 +170,44 @@ def _run(*args: str, check: bool = True, capture: bool = False) -> subprocess.Co
     return subprocess.run(list(args), **kwargs)
 
 
+# ---------- name normalization ------------------------------------------
+
+# Compose project names (and image refs) share a tight regex. Compose is
+# the strictest of the three: `^[a-z0-9][a-z0-9_-]*$`. Image refs allow
+# `.` as a separator; containers allow uppercase. We normalize to the
+# compose regex so the same string is valid as all three.
+_VALID_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _normalize_name(raw: str) -> str:
+    """Lowercase + replace invalid chars with '-'; collapse runs; trim ends.
+
+    Exits if the result is empty or doesn't start with [a-z0-9]. Printed
+    warning when normalization actually changed anything — the disk dir
+    keeps its original name; only the embedded image/container/project
+    identity uses the normalized form.
+    """
+    s = raw.lower()
+    s = re.sub(r"[^a-z0-9_-]+", "-", s)
+    s = re.sub(r"-{2,}", "-", s)
+    s = s.strip("-_")
+    if not s:
+        sys.exit(f"basename {raw!r} normalizes to an empty string — rename the directory")
+    if not _VALID_NAME.match(s):
+        sys.exit(f"basename {raw!r} normalizes to {s!r}, which still isn't a valid compose project name")
+    if s != raw:
+        print(f"note: basename {raw!r} normalized to {s!r} for image/container/project name")
+    return s
+
+
 # ---------- cmd: new ----------------------------------------------------
 
 def cmd_new(args: argparse.Namespace) -> None:
     target = Path(args.target if args.target else ".").resolve()
     target.mkdir(parents=True, exist_ok=True)
-    name = target.name
-    if not name or " " in name or name.startswith("."):
-        sys.exit(f"invalid workspace basename: {name!r}  (from path {target})")
+    if not target.name or target.name.startswith("."):
+        sys.exit(f"invalid workspace dir: {target}  (must have a non-empty basename not starting with '.')")
+    name = _normalize_name(target.name)
 
     # If the user didn't pick any of the mixin-style flags, seed the
     # common defaults (ssh + gh + claude). --socket is orthogonal and
@@ -405,7 +436,7 @@ def _translate_compose(compose_yaml: Path, project: str) -> Path:
 
 def passthrough(argv: list[str]) -> None:
     ws = _find_workspace()
-    project = ws.name
+    project = _normalize_name(ws.name)
     compose_json = _translate_compose(ws / ".saturn" / "compose.yaml", project)
 
     cmd = ["docker", "compose", "-f", str(compose_json), "-p", project, *argv]

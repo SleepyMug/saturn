@@ -8,6 +8,8 @@ There is no global registry of workspaces. A directory *becomes* a workspace the
 
 The workspace's **basename** (the dir's final path component) drives container and image identity: `saturn_<basename>`, `localhost/saturn-<basename>:latest`, container cwd `/root/<basename>`. Compose project name is also set to the basename (via `-p <basename>` on every invocation) so compose's default naming (from the compose file's dir = `.saturn`) doesn't collide across workspaces.
 
+The basename is **normalized** before embedding. Docker image refs, container names, and compose project names share a tight regex (the strictest is compose's `^[a-z0-9][a-z0-9_-]*$`); `_normalize_name` lowercases, replaces any char not in `[a-z0-9_-]` with `-`, collapses consecutive `-`, and trims leading/trailing `-_`. A workspace at `/home/user/MyProj` becomes `myproj` for identity; the directory on disk keeps its original name. A note is printed when normalization actually changes anything so the disk/identity split is visible.
+
 ## Provided APIs
 
 ### `cmd_new(args) -> None`
@@ -15,7 +17,7 @@ The workspace's **basename** (the dir's final path component) drives container a
 Seeds `<target>/.saturn/{Dockerfile,compose.yaml}` from templates.
 
 1. Resolve `target` (cwd default). `mkdir -p` if missing.
-2. Validate basename (non-empty, no leading `.`, no spaces — it has to be a valid docker image tag component).
+2. Validate the dir has a non-empty basename not starting with `.`; run `_normalize_name(target.name)` to get the compose-safe identity.
 3. `mkdir -p <target>/.saturn`; write `Dockerfile` and `compose.yaml` if absent (never overwrites).
 4. Host mode only: for each flag, auto-create the host-side source path if missing (`mkdir -p` for dirs, `touch` for files) so the first `up` doesn't fail the bind mount. Guest mode skips auto-create.
 
@@ -93,7 +95,7 @@ Works because the current workspace is bind-mounted; `./sub/.saturn/` gets writt
 
 ## Execution-context constraints
 
-- **Basename must be a valid docker image-ref component** (lowercase, `[a-z0-9_-]`). Capital letters produce `localhost/saturn-MyDir:latest` which docker rejects.
+- **Basename is normalized to the compose project-name regex** (`^[a-z0-9][a-z0-9_-]*$`). Uppercase, dots, spaces, and other special chars are replaced with `-`. The disk dir keeps its original name; only the embedded identity normalizes. A basename that normalizes to empty (e.g. `...`, `__`) is rejected — rename the dir.
 - **No global listing.** For cross-workspace visibility, use `docker ps --filter name=saturn_` (or filter by the `com.docker.compose.project` label compose sets).
 - **Basename collisions surface at `up` time.** Two workspaces with the same basename map to the same container/image names; the second `up` fails with a "container name in use" error. Rename a dir to disambiguate.
 - **`compose.yaml` is the source of truth.** Saturn never writes to it after `new`. The `compose.json` next to it is a regenerated derivative (translated spec) and can be deleted at any time — the next saturn invocation rewrites it.
