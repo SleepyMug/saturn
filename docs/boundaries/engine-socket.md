@@ -4,7 +4,9 @@
 
 ## Overview
 
-saturn containers reach the host's container engine by bind-mounting the host's engine socket at `/var/run/docker.sock` inside. The container runs as root (no custom user, no sudo). Under rootless engines, the user namespace maps container-uid 0 back to the invoking host user (e.g. uid 1000), so the container-root process appears to the host kernel as the socket owner — `open()` succeeds without any further privilege trick.
+Saturn containers reach the host's container engine by bind-mounting the host's engine socket at `/var/run/docker.sock` inside. The container runs as root (no custom user, no sudo). Under rootless engines, the user namespace maps container-uid 0 back to the invoking host user (e.g. uid 1000), so the container-root process appears to the host kernel as the socket owner — `open()` succeeds without any further privilege trick.
+
+Saturn itself uses the socket for three things: (a) talking to the host engine via `docker` CLI (`DOCKER_HOST=unix://...`); (b) running `docker compose` against the host engine; (c) self-inspection (`docker inspect <hostname>`) to retrieve the current container's bind-mount list for reverse path translation.
 
 ## Both sides' perspective
 
@@ -23,13 +25,13 @@ saturn containers reach the host's container engine by bind-mounting the host's 
 
 ## Data representation at the boundary
 
-Unix domain socket carrying the Docker Engine HTTP API (used by both docker and podman's docker-compat listener). saturn's side always speaks this via the `docker` CLI with `DOCKER_HOST=unix:///var/run/docker.sock`.
+Unix domain socket carrying the Docker Engine HTTP API (used by both docker and podman's docker-compat listener). Saturn's side always speaks this via the `docker` CLI (with the `compose` plugin) and `DOCKER_HOST=unix:///var/run/docker.sock`.
 
 ## Ownership and lifecycle
 
-- The socket's lifecycle is managed by the host (systemd user unit for `podman.socket`, etc.). saturn never creates or destroys it.
-- saturn's role is only to bind-mount `$HOST_SOCK` into each container it launches at `/var/run/docker.sock`.
-- `$HOST_SOCK` propagates into nested saturn via the `SATURN_HOST_SOCK` env var so the *innermost* saturn still knows the host's path — see [nested-env.md](nested-env.md).
+- The socket's lifecycle is managed by the host (systemd user unit for `podman.socket`, etc.). Saturn never creates or destroys it.
+- Saturn's role is only to bind-mount the host socket into each container it launches at `/var/run/docker.sock`. In practice this is declared in the workspace's `compose.yaml` via `- ${SATURN_SOCK}:/var/run/docker.sock` (seeded by `saturn new --socket`).
+- Inside a saturn container, `SATURN_SOCK=/var/run/docker.sock` is set in the compose-level environment; compose substitutes this at `config` time before the spec is evaluated. The reverse-lookup step then translates the inside path back to the real host socket path when preparing specs for child workspaces.
 
 ## Constraints per side
 
@@ -45,6 +47,6 @@ Unix domain socket carrying the Docker Engine HTTP API (used by both docker and 
 
 ## Security note
 
-Bind-mounting this socket grants full control of your engine to the container — privileged sibling with `/` mounted is possible. Saturn additionally bind-mounts the current workspace dir at `/root/<name>` (wherever it lives on the host) and each selected mixin slot's host path at the slot's fixed container target (e.g. `/root/.ssh`). Only the current workspace is mounted — nothing else from `$HOME` or elsewhere. This is a meaningful blast radius; acceptable for a personal dev tool, not acceptable for untrusted code.
+Bind-mounting this socket grants full control of your engine to the container — privileged sibling with `/` mounted is possible. Saturn additionally bind-mounts whatever the workspace's `compose.yaml` declares — typically the workspace dir at `/root/<basename>`, plus any mixin-style bind mounts `saturn new --ssh/--claude/...` generated (e.g. `${HOME}/.ssh:/root/.ssh`). The blast radius is whatever that compose file lists. This is acceptable for a personal dev tool, not acceptable for untrusted code.
 
 `IS_SANDBOX=1` in the base image tells tools like Claude Code that running as root is intentional — it is not an actual sandbox.

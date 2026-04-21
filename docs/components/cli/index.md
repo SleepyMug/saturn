@@ -1,68 +1,79 @@
 # CLI
 
-> Argparse subparser tree, `main()` dispatch, and a sys.argv intercept for `exec` so user commands keep their flags.
+> Three saturn-specific commands (`new`, `base`, `shell`) and a pass-through for everything else. Argparse is used only where flags exist; unknown argv goes through verbatim to `docker compose`.
 
 ## Overview
 
-saturn is argparse-driven. `main()` assembles a tree of subparsers, parses `sys.argv`, and dispatches to a `cmd_*` function via `args.fn(args)`. One special case: `saturn exec <cmd...>` must preserve arbitrary flags in `<cmd...>` (e.g. `saturn exec ls -la`), so `main()` intercepts `sys.argv[1] == "exec"` before argparse runs.
+`main()` reads `sys.argv[1]` and routes on three cases:
+
+1. `new` — argparse handles `target` + boolean flags → `cmd_new`.
+2. `base` — argparse handles the `default` / `build <file>` subcommands → `cmd_base_default` / `cmd_base_build`.
+3. Everything else — becomes pass-through: saturn translates the compose spec (env substitution, reverse mount lookup if in guest mode), writes `.saturn/compose.json`, and invokes `docker compose -f compose.json -p <basename> <argv...>`.
+
+`saturn shell` is a thin alias — it's rewritten to `exec dev bash` before pass-through dispatch.
 
 ## Provided APIs
 
 ### `main() -> None`
 
-Entry point when the script is invoked directly.
+Entry point when invoked as `saturn`.
 
-- Reads `sys.argv`; if `sys.argv[1] == "exec"`, runs `cmd_exec(Namespace(cmd=sys.argv[2:]))` and returns before argparse parses anything.
-- Otherwise builds the argparse tree and parses normally.
-- If no `fn` attribute is set (user typed `saturn` or `saturn base` with no subcommand), prints help.
-- Propagates `KeyboardInterrupt` as exit 130 and `subprocess.CalledProcessError` with the child's exit code.
+- Empty argv (or `-h` / `--help` / `help`) prints the module docstring and returns.
+- `argv[0] == "new"` parses the rest with argparse (one optional positional, one bool per flag) and calls `cmd_new`.
+- `argv[0] == "base"` dispatches to the base subparser.
+- `argv[0] == "shell"` rewrites argv to `["exec", "dev", "bash"]` and falls through.
+- Otherwise calls `passthrough(argv)`.
+- Propagates `KeyboardInterrupt` as exit 130; `subprocess.CalledProcessError` with the child's returncode.
 
 ### Command surface
 
-All commands live at top level — there is no `project` or `workspace` group.
+**Saturn-specific:**
 
 | Command | Handler | Semantics |
 |---|---|---|
-| `new [dir]` | `cmd_new` | `mkdir -p <dir>` (default cwd), then `mkdir -p <dir>/.saturn` and seed `.saturn/Containerfile` if absent. No engine calls. |
-| `up [dir] [--mixins <csv>] [--mixin-root <dir>]` | `cmd_up` | Resolve `<dir>` (default cwd) to a `Workspace`. Check socket. If container already running → no-op. Otherwise: resolve+auto-create mixin slots, `ensure_base`, build workspace image from `<dir>/.saturn/Containerfile` (if present), tear down any stopped `saturn_<name>`, `docker run` with the workspace bind-mounted at `/root/<name>`. `--mixins` selects mixin bundles (default `DEFAULT_MIXINS`; `--mixins ''` opts out). `--mixin-root` (host mode) re-roots mixin default paths. |
-| `down` | `cmd_down` | `docker rm -f saturn_<name>` where `<name>` = cwd workspace basename. Idempotent. |
-| `shell` | `cmd_shell` | `docker exec -it saturn_<name> /bin/bash` for cwd's workspace; errors if container isn't running. |
-| `exec <cmd...>` | `cmd_exec` | `docker exec -it saturn_<name> <cmd...>` for cwd's workspace; errors if container isn't running. |
+| `new [dir] [--ssh] [--gh] [--claude] [--codex] [--socket]` | `cmd_new` | `mkdir -p <dir>` (default cwd), then `mkdir -p <dir>/.saturn` and seed `Dockerfile` + `compose.yaml`. Host-mode auto-create for each selected flag's bind source. No engine calls. |
+| `base default` | `cmd_base_default` | Force-rebuild `localhost/saturn-base:latest` from the inlined minimal Dockerfile. |
+| `base build <file>` | `cmd_base_build` | Force-rebuild the base from a user-supplied Dockerfile. Error if the file is missing. |
+| `shell` | alias | Rewrites argv to `exec dev bash` → pass-through. |
 
-`base` group (saturn-base image lifecycle):
+**Pass-through** (anything not listed above):
 
-| Command | Handler | Semantics |
-|---|---|---|
-| `base template [--mixins <csv>]` | `cmd_base_template` | Write the rendered Containerfile to stdout. Mixin setups splice as `RUN` lines. Defaults to `DEFAULT_MIXINS`. |
-| `base default [--mixins <csv>]` | `cmd_base_default` | Force-rebuild saturn-base (`docker rmi` then `_build_base(_render_base_containerfile(mixins))`). Defaults to `DEFAULT_MIXINS`. |
-| `base build <file>` | `cmd_base_build` | Force-rebuild saturn-base from a user-supplied Containerfile (errors if missing). **No `--mixins`** — user file is verbatim. |
+| Example | Becomes |
+|---|---|
+| `saturn up -d` | `docker compose -f .saturn/compose.json -p <ws> up -d` |
+| `saturn up` | `docker compose -f .saturn/compose.json -p <ws> up` *(foreground, not `-d`)* |
+| `saturn down` | `docker compose -f .saturn/compose.json -p <ws> down` |
+| `saturn exec dev bash` | `docker compose -f .saturn/compose.json -p <ws> exec dev bash` |
+| `saturn logs -f` | `docker compose -f .saturn/compose.json -p <ws> logs -f` |
+| `saturn ps` | `docker compose -f .saturn/compose.json -p <ws> ps` |
+
+The workspace is discovered by walking cwd upward for `.saturn/compose.yaml`; the project name (`-p`) is the workspace basename. For commands that shouldn't be tied to a workspace, `cd` outside any `.saturn`-bearing tree — saturn exits with a clear "no `.saturn/compose.yaml`" message.
 
 ## Consumed APIs
 
-- [`Workspace`, `_resolve_target`](../workspace/index.md#provided-apis) — target → Workspace resolution; single point of consumption for `SATURN_HOST_WORKSPACE` / `SATURN_WORKSPACE`.
-- [`ensure_base()`, `_build_base()`](../base-image/index.md#provided-apis) — saturn-base availability.
-- [engine wrappers (`engine`, `engine_ok`, `engine_out`, `engine_exec`)](../engine/index.md#provided-apis) — subprocess to docker CLI.
-- [runtime helpers (`check_socket`, `container_status`, `_interactive_flags`, `_env_flags`, `_base_mount_flags`)](../engine/index.md#provided-apis).
-- [mixin helpers (`MIXINS`, `_cli_mixins`, `_render_base_containerfile`, `_resolve_mixin_slots`, `_ensure_mixin_host_paths`, `_mixin_mount_flags`)](../mixins/index.md#provided-apis).
+- [`cmd_new`, `_find_workspace`](../workspace/index.md#provided-apis) — seeding templates + finding cwd's workspace.
+- [`cmd_base_default`, `cmd_base_build`, `_build_base`](../base-image/index.md#provided-apis) — base image lifecycle.
+- [`_translate_compose`, `passthrough`](../engine/index.md#provided-apis) — the translate + forward pipeline.
 
 ## Workflows
 
-### Dispatch + exec intercept
+### Dispatch flow
 
-1. `main()` inspects `sys.argv[1]`. If it's `"exec"`, it constructs a Namespace by hand and calls `cmd_exec` — bypassing argparse entirely so user flags survive.
-2. Otherwise argparse parses. Every subparser sets `fn` via `set_defaults(fn=...)`.
-3. If `fn` is unset (empty `base` subcommand), print top-level help and exit 0.
-
-### Interactive I/O
-
-`_interactive_flags()` returns `["-it"]` if stdin is a TTY, else `["-i"]`. The docker CLI rejects `-t` without a TTY, so unguarded use breaks piped invocations (`saturn exec ls | head`).
+1. `main()` inspects `sys.argv[1]`.
+2. For `new` and `base`, argparse parses argument-specific flags (no REMAINDER hacks — the pass-through path covers anything with a free-form argv).
+3. For `shell`, argv is rewritten and falls through.
+4. Pass-through calls `passthrough(argv)`:
+   - `_find_workspace()` → walk cwd upward for `.saturn/compose.yaml`.
+   - `_translate_compose(compose_yaml, project)` → `.saturn/compose.json`.
+   - `subprocess.run(["docker", "compose", "-f", compose_json, "-p", project, *argv])`.
+   - On non-zero exit, print the full command that was run before propagating the exit code.
 
 ### stdout line buffering
 
-`sys.stdout.reconfigure(line_buffering=True)` at startup so saturn's own `print()` interleaves correctly with subprocess output when piped.
+`sys.stdout.reconfigure(line_buffering=True)` at module top so saturn's own `print()` interleaves correctly with subprocess output when piped.
 
 ## Execution-context constraints
 
-- No third-party deps. argparse + subprocess + pathlib + shutil + tempfile + os/sys only.
-- `os.execvp` is used for interactive commands (`shell`, `exec`) so saturn exits and the child process takes over; errors after that point won't be caught.
-- `down`, `shell`, `exec` take no positional args — they derive the workspace from cwd. To operate on a different workspace, `cd` there first.
+- **No argparse REMAINDER intercept.** The old `saturn exec <cmd> [args...]` pre-argparse hack is gone — pass-through covers arbitrary argv naturally.
+- **`saturn up` is foreground by default.** Compose's default is foreground; saturn doesn't rewrite to `-d`. Users who want detach must pass `-d` themselves. (This is a deliberate divergence from the pre-compose saturn, where `up` was always detached.)
+- **stdlib only.** argparse, subprocess, pathlib, shutil, tempfile, os, sys, json, socket. No third-party deps.

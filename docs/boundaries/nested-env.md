@@ -1,66 +1,67 @@
 # Boundary: SATURN_* env vars for nesting
 
-> The env contract that lets saturn inside a saturn container create siblings on the host engine — distinct from the *host* shell's env, whose role is limited.
+> A tiny two-var contract (`SATURN_IN_GUEST`, `SATURN_SOCK`) — everything else that used to live here (workspace paths, socket paths, per-mixin host paths) is now derived by reverse mount lookup through the engine socket.
 
 ## Overview
 
-When saturn launches a container (`saturn up`), it injects a specific block of `SATURN_*` environment variables. Inside, saturn re-reads those on startup and derives its own behavior, so nested invocations act on the host engine transparently. Four families of vars cross this boundary: host-side socket/home (for nested socket access + mixin default fallbacks), the workspace pair (host-side + container-side paths of the current workspace — load-bearing for `_resolve_target`), per-slot host paths (one per mixin slot, load-bearing for nested mixin mounts), and the host-vs-guest flag.
+Previous saturn versions propagated a whole block of env vars for nested-container operation: `SATURN_HOST_WORKSPACE`, `SATURN_WORKSPACE`, `SATURN_HOST_SOCK`, `SATURN_HOST_HOME`, and one `SATURN_MIXIN_<SLOT>` per mixin. All of these existed to let inner saturn translate inside-paths into host-paths when bind-mounting a sibling.
 
-## Both sides' perspective
+That entire surface collapsed into a single generic mechanism: inner saturn asks the host engine (via the bind-mounted socket) `docker inspect <self>` → `.Mounts` list → translate any inside-path source by finding a mount whose destination is an ancestor and computing `mount.Source + rel`. See [engine](../components/engine/index.md#provided-apis).
 
-### Host shell (user's interactive terminal)
+What's left in the env contract is the minimum needed to bootstrap that mechanism.
+
+## Host shell (user's interactive terminal)
 
 Vars the user may set to customize host-side saturn:
 
-- `SATURN_ENGINE=podman|docker` — host engine family (default `podman`). Only picks the default socket path; saturn always shells to `docker`.
-- `SATURN_SOCK=<path>` — explicit socket path override.
-- `SATURN_BASE_IMAGE=<ref>` — override base image tag.
-- `SATURN_HOST_HOME=<path>` — override the host-side home (default `$HOME` / `Path.home()`). Normally unnecessary.
-- `SATURN_MIXIN_<SLOT>=<path>` — override a mixin slot's host-side source path. When unset on host, defaults to `$HOST_HOME/<default_host>` from the slot schema. Example: `SATURN_MIXIN_CLAUDE_JSON=/some/scratch/claude.json` gives the container an isolated `~/.claude.json`.
+- `SATURN_SOCK=<path>` — explicit socket path override. Default: first of `$XDG_RUNTIME_DIR/podman/podman.sock`, `$XDG_RUNTIME_DIR/docker.sock`, `/var/run/docker.sock`. Sets `DOCKER_HOST=unix://...` at module import and is re-exported so `${SATURN_SOCK}` substitutes inside workspace `compose.yaml`.
+- `SATURN_BASE_IMAGE=<ref>` — override the base image tag.
+- `DOCKER_HOST=<uri>` — normally derived from `SATURN_SOCK`. Setting it directly also works.
 
 Vars the user should NOT set on the host:
 
-- `SATURN_HOST_SOCK` — meaningful only inside a container; the default (`SOCK`) is correct for host.
-- `SATURN_HOST_WORKSPACE` / `SATURN_WORKSPACE` — meaningful only inside a container. The outer saturn sets them per-container; setting them on the host shell is stale and confusing.
-- `SATURN_IN_GUEST` — meaningful only inside a container. Setting it on host would disable host-mode auto-create and require every mixin env var explicitly.
+- `SATURN_IN_GUEST` — meaningful only inside a container. Setting it on host would flip saturn into guest mode and try reverse lookup on the host, which has no outer container to inspect.
 
-### Inside a saturn container
+## Inside a saturn container
 
-saturn injects these via `_env_flags(slots, workspace)`:
+The workspace's `compose.yaml` (seeded by `saturn new`) carries:
 
-| Var | Value at injection | Role inside |
+```yaml
+environment:
+  SATURN_IN_GUEST: "1"
+  SATURN_SOCK: /var/run/docker.sock
+```
+
+Both are static; neither is computed or propagated per-launch.
+
+| Var | Value inside | Role |
 |---|---|---|
-| `SATURN_ENGINE` | the host's `ENGINE` (e.g. `podman` or `docker`) | Identifies the actual engine family behind the bind-mounted socket. Drives the BuildKit-vs-classic-builder decision inside. |
-| `SATURN_SOCK` | `/var/run/docker.sock` | Inside path of the bind-mounted host socket; inside saturn sets `DOCKER_HOST=unix://...` from this. |
-| `SATURN_HOST_SOCK` | `<host's SOCK>` | **Host-side** path. When the nested saturn creates another child container, this is the path it bind-mounts. Without propagating, double-nesting would try to bind-mount `/var/run/docker.sock` (a container path) on the host. |
-| `SATURN_HOST_HOME` | `<host's HOST_HOME>` | **Host-side** `$HOME` path. Informational + used as the prefix for mixin default fallbacks (moot in guest mode since defaults don't apply there). |
-| `SATURN_HOST_WORKSPACE` | `workspace.host_path` | **Host-side** absolute path of the current workspace. Consumed by inner `_resolve_target` to compute a target's host path: `host_path = SATURN_HOST_WORKSPACE / rel`. |
-| `SATURN_WORKSPACE` | `workspace.container_dir` (e.g. `/root/<name>`) | **Container-side** path of the current workspace. Consumed by inner `_resolve_target` to validate a target is under it and to compute `rel = target.relative_to(SATURN_WORKSPACE)`. |
-| `SATURN_IN_GUEST` | `1` | Presence ⇒ inside a container (`IS_HOST=False`). Inner saturn switches to guest mode: mixin slot env vars are required, host-mode defaults and auto-create are disabled. |
-| `SATURN_MIXIN_<SLOT>` | `<host_path>` for each resolved slot of each selected mixin | **Host-side** path. Used as the bind-mount *source* when inner saturn spawns a sibling with the same mixin. One var per slot; outer saturn injects only the slots for mixins it selected. |
+| `SATURN_IN_GUEST` | `"1"` | Presence ⇒ `IS_HOST=False`. Enables reverse mount lookup + guest-mode build-before-handoff in `_translate_compose`. |
+| `SATURN_SOCK` | `/var/run/docker.sock` | Inside path of the bind-mounted host socket. Sets `DOCKER_HOST=unix://...`. Substituted by compose in `${SATURN_SOCK}:/var/run/docker.sock` mounts so the substitution works identically in both modes. |
 
-Note: `HOME` is **not** injected. The container's `HOME` stays at the image default (`/root`). Both the workspace dir (`/root/<name>`) and mixin targets (`/root/.ssh`, `/root/.claude`, `/root/.claude.json`, `/root/.codex`, `/root/.config/gh`) live under `/root/`, so `~/<name>` and `~/.ssh` etc. resolve naturally.
+That's the entire boundary. No host-side paths propagate. The inner saturn learns everything it needs by inspecting its own container through the socket.
+
+Note: `HOME` is not injected by saturn. The container's `HOME` stays at the image default (`/root`). Bind mounts of `${HOME}/.ssh`, `${HOME}/.claude`, etc. land on `/root/.ssh`, `/root/.claude` in guest mode (since `$HOME` substitutes client-side to whatever it currently is), and reverse lookup maps those back to the real host `${HOME}` paths when a sibling is launched.
 
 ## Data representation at the boundary
 
-Plain env vars (strings) passed via `docker run -e KEY=VALUE`. No escaping concerns — saturn's values are known-safe (paths, enum strings, validated workspace basenames). `SATURN_IN_GUEST` is set to the literal string `"1"`.
+Plain env vars (strings) passed via compose's `environment:` block. `SATURN_IN_GUEST` is the literal string `"1"` (quoted in yaml to avoid getting parsed as an integer).
 
 ## Ownership and lifecycle
 
-- Host saturn owns the *contents* of each var and injects a fresh set on every `docker run` (no persistence).
-- Inside saturn reads them once at module import; after that they're effectively immutable for that process.
-- The host-side paths (`SATURN_HOST_SOCK`, `SATURN_HOST_HOME`, `SATURN_HOST_WORKSPACE`, `SATURN_MIXIN_<SLOT>`) and the container-side pair (`SATURN_WORKSPACE`) are load-bearing for nesting: inner saturn consumes them directly. `SATURN_IN_GUEST` is pure signalling.
+- Both vars are static workspace-level config, not runtime-propagated. Saturn writes them into the compose.yaml once at `saturn new` time.
+- If the user edits compose.yaml to remove them, nested saturn breaks (reverse lookup never fires; compose handoff fails). Document this as a "don't touch these" for the seeded template.
+- Nothing else in the SATURN_* namespace is load-bearing for nesting — per-mixin paths, workspace paths, host socket path, host home, all derived on demand.
 
 ## Constraints per side
 
 ### Host constraints
 
-- Must not have `SATURN_HOST_SOCK`, `SATURN_HOST_WORKSPACE`, `SATURN_WORKSPACE`, or `SATURN_IN_GUEST` leaked from a previous inside session. `SATURN_HOST_SOCK` normally defaults to `SOCK` (harmless); a stale `SATURN_IN_GUEST=1` would flip host-mode off, require every mixin env var explicitly, and make every `saturn up` fail because the workspace vars aren't set on host.
-- `SATURN_HOST_HOME` defaults to `Path.home()`. Override only if you know why.
-- `SATURN_MIXIN_<SLOT>` values are optional on host; defaults fall back to `$HOST_HOME/<default_host>`. Missing host paths are auto-created (dir or file per the slot's `kind`).
+- Stale `SATURN_IN_GUEST=1` in the user's shell environment (leaked from `saturn shell`) will flip host saturn into guest mode; `_current_container_mounts` then tries to self-inspect the host process (not a container), which fails. Unset it or restart the shell.
+- `SATURN_SOCK` pointing at a dead socket yields a build/exec failure from the first engine call. `docker compose config` output mentions "connection refused" — the error is clear enough to debug.
 
 ### Container constraints
 
-- `SATURN_HOST_SOCK`, `SATURN_HOST_HOME`, and `SATURN_HOST_WORKSPACE` are meaningful only as host-side paths. Inner saturn never `open()`s them directly — they're only bind-mount sources.
-- `SATURN_MIXIN_<SLOT>` values are host-side paths; inside saturn uses them only as bind-mount sources when spawning a sibling. They are not resolvable from inside the container's filesystem namespace.
-- With `SATURN_IN_GUEST=1`, `_resolve_mixin_slots` requires every selected mixin's slot env vars and `_resolve_target` requires a target path under `SATURN_WORKSPACE`. Missing → exit with a labelled message. No filesystem writes.
+- `SATURN_IN_GUEST=1` must be in the environment; the outer saturn's `saturn new` template sets it. Removing it from `compose.yaml`'s `environment:` block turns off reverse lookup even inside a container.
+- `SATURN_SOCK` must match the container-side bind-mount target of the socket (`/var/run/docker.sock` by saturn convention). Changing one without the other breaks DOCKER_HOST.
+- Do not override `hostname:` in the workspace's `compose.yaml`. Saturn self-inspects by `socket.gethostname()` (default: short container id). Overriding the hostname breaks reverse lookup — `docker inspect <your-hostname>` will only succeed if you also named the container that.

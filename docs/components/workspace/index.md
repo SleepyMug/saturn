@@ -1,74 +1,101 @@
-# Workspace model
+# Workspace (the `.saturn/` directory)
 
-> A workspace is any directory with a `.saturn/` marker. There is no global registry. `saturn up [dir]` bind-mounts the directory at `/root/<basename>` inside a container; other lifecycle commands act on the workspace for cwd.
+> A workspace is any directory containing `.saturn/compose.yaml`. `saturn new [dir] [--flags]` seeds the template pair (`Dockerfile` + `compose.yaml`); every other subcommand finds the workspace by walking cwd upward.
 
 ## Overview
 
-The previous "project" model required directories under `$HOME/saturn/<name>` and maintained a global list via `saturn ls` / `saturn rm`. That coupling is gone. A workspace is now entirely identified by its absolute host path; the container and image names are derived from its basename.
+There is no global registry of workspaces. A directory *becomes* a workspace the moment it has a `.saturn/` subdir with a `compose.yaml` in it. `saturn new` is the shortcut for producing that pair from a small set of opt-in flags; it's otherwise an ordinary filesystem operation.
 
-Two paths matter per workspace:
-
-- **`host_path`** — host-absolute path. Every `-v <src>:<dst>` source and every `docker build` context/file argument uses this (the daemon resolves on the host).
-- **`view_path`** — the path visible to the current saturn process. Equal to `host_path` on the host; a container-side path inside a saturn container. Filesystem checks (`is_dir`, `is_file`, `mkdir`) must use this.
+The workspace's **basename** (the dir's final path component) drives container and image identity: `saturn_<basename>`, `localhost/saturn-<basename>:latest`, container cwd `/root/<basename>`. Compose project name is also set to the basename (via `-p <basename>` on every invocation) so compose's default naming (from the compose file's dir = `.saturn`) doesn't collide across workspaces.
 
 ## Provided APIs
 
-### `class Workspace(host_path: Path, view_path: Path)`
+### `cmd_new(args) -> None`
 
-Validates the basename (non-empty, no `/`, no leading `.`, no spaces) and exposes:
+Seeds `<target>/.saturn/{Dockerfile,compose.yaml}` from templates.
 
-| Attribute | Value | Used as |
-|---|---|---|
-| `host_path` | input | bind-mount source; `docker build` args |
-| `view_path` | input | filesystem checks by this saturn process |
-| `name` | `host_path.name` | identity |
-| `container` | `saturn_<name>` | container name |
-| `image` | `localhost/saturn-<name>:latest` | image name |
-| `container_dir` | `/root/<name>` | bind-mount target inside; cwd |
-| `containerfile_view()` | `view_path / ".saturn" / "Containerfile"` | existence check |
-| `containerfile_host()` | `host_path / ".saturn" / "Containerfile"` | `docker build -f` arg |
+1. Resolve `target` (cwd default). `mkdir -p` if missing.
+2. Validate basename (non-empty, no leading `.`, no spaces — it has to be a valid docker image tag component).
+3. `mkdir -p <target>/.saturn`; write `Dockerfile` and `compose.yaml` if absent (never overwrites).
+4. Host mode only: for each flag, auto-create the host-side source path if missing (`mkdir -p` for dirs, `touch` for files) so the first `up` doesn't fail the bind mount. Guest mode skips auto-create.
 
-Basename collisions: two workspaces with the same basename map to the same container/image names and cannot run concurrently. Surface at `saturn up` time via docker's "container name in use" error.
+Flags are independently opt-in; omitting all gives a minimal workspace with just the source tree bind-mounted. Order is not significant.
 
-### `CONTAINERFILE_TEMPLATE: str`
+| Flag | Dockerfile effect | compose.yaml effect | Auto-create target |
+|---|---|---|---|
+| `--ssh` | `RUN apt-get install openssh-client` | `- ${HOME}/.ssh:/root/.ssh` | `~/.ssh` (dir) |
+| `--gh` | `RUN apt-get install gh` | `- ${HOME}/.config/gh:/root/.config/gh` | `~/.config/gh` (dir) |
+| `--claude` | `RUN apt-get install nodejs npm && npm i -g @anthropic-ai/claude-code` | `- ${HOME}/.claude:/root/.claude`, `- ${HOME}/.claude.json:/root/.claude.json` | `~/.claude` (dir), `~/.claude.json` (file) |
+| `--codex` | `RUN apt-get install nodejs npm && npm i -g @openai/codex` | `- ${HOME}/.codex:/root/.codex` | `~/.codex` (dir) |
+| `--socket` | (none) | `- ${SATURN_SOCK}:/var/run/docker.sock` | — |
 
-Seed content for a freshly-created `.saturn/Containerfile`: `FROM localhost/saturn-base:latest` plus a commented `RUN apt-get …` example.
+When both `--claude` and `--codex` are passed, the `nodejs npm` install is emitted once, followed by the two `npm install -g` lines.
 
-### `_resolve_target(arg: str | None) -> Workspace`
+### `_find_workspace() -> Path`
 
-Turns a CLI target (or cwd, when `arg is None`) into a `Workspace`.
+Walks cwd upward until it finds a directory containing `.saturn/compose.yaml`. Exits with a suggestion to run `saturn new` if nothing is found by the filesystem root. This is the lone mechanism that associates a command with a workspace — there are no positional target args on lifecycle commands (`up`, `down`, `shell`, `exec`, etc.). `cd` to switch workspaces.
 
-- Resolves `arg` (or `.`) to an absolute path; exits if the path isn't a directory.
-- **Host mode** (`IS_HOST`): `host_path == view_path == resolved`.
-- **Guest mode**: requires `SATURN_HOST_WORKSPACE` and `SATURN_WORKSPACE`. Exits if either is unset. The resolved path must be under `SATURN_WORKSPACE` (the current container's workspace). The host path is computed as `SATURN_HOST_WORKSPACE / rel` where `rel = resolved.relative_to(SATURN_WORKSPACE)`. Targets outside the current workspace exit with a labelled message.
+### Seeded `compose.yaml` shape
 
-This is the single point where workspace env vars are consumed — they are load-bearing, not just propagated.
+```yaml
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: localhost/saturn-<name>:latest
+    container_name: saturn_<name>
+    init: true
+    working_dir: /root/<name>
+    command: ["sleep", "infinity"]
+    environment:
+      SATURN_IN_GUEST: "1"
+      SATURN_SOCK: /var/run/docker.sock
+    volumes:
+      - ..:/root/<name>
+      # (plus one line per selected flag)
+```
+
+- `build.context: .` means the `.saturn/` dir is the build context. Small, fast, and `COPY` works on anything you drop into `.saturn/`.
+- `..:/root/<name>` — the workspace root (parent of `.saturn/`) is bind-mounted at `/root/<name>`. Compose resolves `..` relative to the compose file's dir, so this works regardless of cwd.
+- `${HOME}` and `${SATURN_SOCK}` are compose env substitutions, done at `compose config` time. On host, they expand to the user's home and the real host socket; in guest mode, they expand to `/root` and `/var/run/docker.sock` (inside paths) — which are then reverse-looked-up to host paths. **One compose.yaml, both modes.**
+
+Users can edit `Dockerfile` and `compose.yaml` freely after seeding. Add services, networks, volumes, extra bind mounts, anything compose supports.
 
 ## Consumed APIs
 
-- `IS_HOST`, `HOST_WORKSPACE`, `WORKSPACE` from module-level env-derived constants ([engine](../engine/index.md#provided-apis)).
-- None within the codebase from other modules.
+- `IS_HOST` from module-level env — gates host-mode auto-create.
+- `BASE_IMAGE` constant — referenced by the seeded `FROM` line.
 
 ## Workflows
 
-### Creation (`saturn new [dir]`)
+### Creation
 
-1. Resolve `dir` (cwd default); `mkdir -p dir` if absent.
-2. Build a `Workspace` via `_resolve_target`.
-3. `mkdir -p <view_path>/.saturn` and seed `Containerfile` if absent.
+```
+saturn new                    # cwd becomes a workspace
+saturn new ~/code/foo --ssh --socket --claude
+```
 
-Nested `saturn new <subdir>` inside a container works because the subdir is under the mounted current workspace: `mkdir` reflects to host.
+Both produce `.saturn/Dockerfile` + `.saturn/compose.yaml`. Auto-create ensures host paths (e.g. `~/.claude.json`) exist before first `up`.
 
-### Launch (`saturn up [dir]`)
+### Nested creation (inside a saturn container)
 
-See [components/cli](../cli/index.md) for the full step sequence. The workspace is constructed once and threaded through the mount/env/build calls.
+```
+saturn new ./sub --socket
+```
 
-### `down` / `shell` / `exec`
+Works because the current workspace is bind-mounted; `./sub/.saturn/` gets written through the bind mount and shows up on host. No auto-create runs (guest mode).
 
-All resolve the workspace from cwd. If the container isn't running, `shell` and `exec` exit with a hint; `down` just removes the container idempotently.
+### Modifying the seeded templates
+
+- Dockerfile: free-form. Install anything you like.
+- compose.yaml: free-form, with two conventions saturn relies on for nested `up`:
+  - Do not override `hostname:`. Saturn self-inspects the running container by `socket.gethostname()`, which defaults to the short container id that compose sets.
+  - Every bind-mount source should be either a path compose can env-substitute to something valid in both modes (`${HOME}/...`, `${SATURN_SOCK}`), or a host-only path if you never plan to run nested.
 
 ## Execution-context constraints
 
-- **Basename must be a valid container/image name component.** Docker image refs require lowercase; a workspace at `/…/MyDir` produces `localhost/saturn-MyDir:latest` which docker rejects. Stick to lowercase + `[a-z0-9_-]`.
-- **Nested target is bounded by the current workspace.** In guest mode, `up` and `new` only work for paths under `SATURN_WORKSPACE`. Targets outside exit with a clear message.
-- **No global discovery.** `saturn ls` and `saturn rm` are gone — the workspace concept doesn't have a registry. Use `docker ps --filter label=saturn.workspace` if you need to see running containers; remove via `saturn down` (in the workspace) or `docker rm -f saturn_<name>`.
+- **Basename must be a valid docker image-ref component** (lowercase, `[a-z0-9_-]`). Capital letters produce `localhost/saturn-MyDir:latest` which docker rejects.
+- **No global listing.** For cross-workspace visibility, use `docker ps --filter name=saturn_` (or filter by the `com.docker.compose.project` label compose sets).
+- **Basename collisions surface at `up` time.** Two workspaces with the same basename map to the same container/image names; the second `up` fails with a "container name in use" error. Rename a dir to disambiguate.
+- **`compose.yaml` is the source of truth.** Saturn never writes to it after `new`. The `compose.json` next to it is a regenerated derivative (translated spec) and can be deleted at any time — the next saturn invocation rewrites it.

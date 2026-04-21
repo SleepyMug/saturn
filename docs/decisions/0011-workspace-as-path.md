@@ -1,6 +1,8 @@
 # 0011 — Drop project management; saturn operates on arbitrary directories
 
 > Revises [0010](0010-workspace-no-path-symmetry.md). The notion of a "project" as a named entry under `$HOME/saturn/` is gone. A workspace is now any directory with a `.saturn/` marker. `saturn ls` and `saturn rm` are removed; `new` / `up` take an optional target directory; `down` / `shell` / `exec` act on cwd. Nested `up` is well-defined via `SATURN_WORKSPACE` (container-side) + `SATURN_HOST_WORKSPACE` (host-side), both now consumed by `_resolve_target`.
+>
+> **Superseded by [0012](0012-compose-native-wrapper.md).** The imperative `docker run` surface (`cmd_up`/`cmd_down`/`cmd_shell`/`cmd_exec` + `_env_flags`/`_base_mount_flags`/`_mixin_mount_flags`) is gone; saturn is a pass-through to `docker compose`. `SATURN_HOST_WORKSPACE` / `SATURN_WORKSPACE` / `SATURN_HOST_SOCK` / `SATURN_HOST_HOME` / `SATURN_MIXIN_*` all removed — reverse mount lookup via `docker inspect <self>` does their job generically. Mixins become `saturn new --<flag>` template fragments.
 
 ## Context
 
