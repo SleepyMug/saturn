@@ -107,7 +107,10 @@ _DF_INSTALL = {
         " && apt-get install -y --no-install-recommends gh \\\n"
         " && rm -rf /var/lib/apt/lists/*\n"
     ),
-    "claude": "RUN curl -fsSL https://claude.ai/install.sh | bash\n",
+    "claude": (
+        "RUN curl -fsSL https://claude.ai/install.sh | bash\n"
+        "ENV PATH=/root/.local/bin:${PATH}\n"
+    ),
     # codex needs nodejs+npm.
     "codex": (
         "RUN apt-get update \\\n"
@@ -487,6 +490,14 @@ def main() -> None:
 
     if argv[0] == "shell":
         argv = ["exec", "dev", "bash"]
+
+    if argv[0] == "up" and not any(a in ("-d", "--detach", "-h", "--help") for a in argv[1:]):
+        print(
+            "note: 'saturn up' attaches to the dev container, whose command is "
+            "'sleep infinity' — you'll see no output and Ctrl+C will stop it. "
+            "Run 'saturn up -d' to start detached, then 'saturn shell' to enter.",
+            file=sys.stderr,
+        )
 
     passthrough(argv)
 
