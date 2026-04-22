@@ -66,6 +66,24 @@ SATURN_SOCK = os.environ.get("SATURN_SOCK") or (
 os.environ["SATURN_SOCK"] = SATURN_SOCK
 os.environ["DOCKER_HOST"] = f"unix://{SATURN_SOCK}"
 
+# Saturn's design assumes a rootless engine: container-uid 0 is mapped
+# back to the invoking host user, so files written from inside land as
+# that user on host. A root-owned socket means a rootful daemon (no
+# userns remap), which breaks that assumption — files flip to root:root
+# on host and the socket hands container-root full host-root. See
+# docs/boundaries/engine-socket.md ("Rootless is load-bearing").
+if IS_HOST and os.getuid() != 0:
+    try:
+        if Path(SATURN_SOCK).stat().st_uid == 0:
+            print(
+                f"saturn: warning: {SATURN_SOCK} is root-owned (rootful engine). "
+                f"Files written from inside will land as root on host; the socket "
+                f"grants container-root host-root. See docs/boundaries/engine-socket.md.",
+                file=sys.stderr,
+            )
+    except OSError:
+        pass
+
 # Podman's docker-compat socket doesn't serve BuildKit; force classic
 # builder. For rootless Docker (buildkit-capable), this is harmless.
 os.environ.setdefault("DOCKER_BUILDKIT", "0")
