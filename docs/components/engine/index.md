@@ -43,20 +43,31 @@ Exits with a pointer at `compose.yaml`'s `hostname:` field if the inspect fails 
 
 Given an inside-path source and the current container's mount list, returns the host path backing `source` — or `None` if no mount's destination is an ancestor. Uses longest-match (sorts mounts by descending destination length, picks the first whose destination is an ancestor via `Path.relative_to`). Skips non-bind mounts (named volumes, tmpfs). Returns `str(mount.Source)` when source equals the destination exactly; otherwise `str(mount.Source / rel)`.
 
-### `_translate_compose(compose_yaml: Path, project: str) -> Path`
+### `_find_overrides(ws: Path) -> list[Path]`
 
-The pipeline heart. Returns the path to the generated `.saturn/compose.json`.
+Discovers compose overrides to layer onto `.saturn/compose.yaml`. Two sources, applied in this order:
 
-1. `docker compose -f <compose_yaml> -p <project> config --format json` → spec dict.
+1. `sorted((ws / ".saturn").glob("compose.override*.yaml"))` — lexically sorted workspace overrides. Matches docker compose's `compose.override.yaml` convention; extended to a glob so `compose.override.local.yaml`, `compose.override.ci.yaml` etc. all participate.
+2. `SATURN_COMPOSE_OVERRIDES` env var — colon-separated absolute paths. Empty segments are skipped. The programmatic path used by callers that prefer not to write a file into `.saturn/`.
+
+See [decision 0014](../../decisions/0014-compose-override-chain.md) for rationale.
+
+### `_translate_compose(compose_files: list[Path], project: str) -> Path`
+
+The pipeline heart. Returns the path to the generated `compose.json` next to the first file in the list. Handles a single-file workspace and an arbitrarily long override chain identically — the merge is compose's job.
+
+1. `docker compose -f <f1> -f <f2> … -p <project> config --format json` → merged spec dict. Compose does scalars-replace/lists-append/maps-deep-merge between files; later files layer on top.
 2. If **host mode**: write spec verbatim as `.saturn/compose.json`.
 3. If **guest mode**:
    a. For each service with a `build:` stanza: `docker build -f <ctx>/<dockerfile> -t <image> <ctx>` (ctx is the inside path compose resolved). On success, `pop` the `build` key from the service. This pre-builds everything before compose sees the spec, and since the resulting spec has only `image:`, compose uses the existing image without re-reading the context.
    b. Call `_current_container_mounts()` once.
    c. For each service's `volumes[]` where `type == "bind"`: `_translate(vol.source, mounts)`. Collect any unresolvable sources. If any → exit with a labelled list; otherwise write the spec as `.saturn/compose.json`.
 
+Reverse mount lookup runs on the *merged* bind sources — a bind declared in an override is resolved the same way as one declared in the base.
+
 ### `passthrough(argv: list[str]) -> None`
 
-Glue. `_find_workspace()` → `_translate_compose()` → `subprocess.run(["docker", "compose", "-f", <compose.json>, "-p", <project>, *argv])`. On non-zero exit, prints the full command that was run (to stderr) before `sys.exit`ing with the child's returncode.
+Glue. `_find_workspace()` → `files = [ws/.saturn/compose.yaml, *_find_overrides(ws)]` → `_translate_compose(files, project)` → `subprocess.run(["docker", "compose", "-f", <compose.json>, "-p", <project>, *argv])`. On non-zero exit, prints the full command that was run (to stderr) before `sys.exit`ing with the child's returncode.
 
 ## Consumed APIs
 

@@ -8,7 +8,7 @@
 
 1. `new` — argparse handles `target` + boolean flags → `cmd_new`.
 2. `base` — argparse handles the `default` / `build <file>` subcommands → `cmd_base_default` / `cmd_base_build`.
-3. Everything else — becomes pass-through: saturn translates the compose spec (env substitution, reverse mount lookup if in guest mode), writes `.saturn/compose.json`, and invokes `docker compose -f compose.json -p <basename> <argv...>`.
+3. Everything else — becomes pass-through: saturn gathers `.saturn/compose.yaml` plus any override files (auto-globbed `compose.override*.yaml` and `SATURN_COMPOSE_OVERRIDES`), translates the merged spec (env substitution, reverse mount lookup if in guest mode), writes `.saturn/compose.json`, and invokes `docker compose -f compose.json -p <basename> <argv...>`.
 
 `saturn shell` is a thin alias — it's rewritten to `exec dev bash` before pass-through dispatch.
 
@@ -64,7 +64,8 @@ The workspace is discovered by walking cwd upward for `.saturn/compose.yaml`; th
 3. For `shell`, argv is rewritten and falls through.
 4. Pass-through calls `passthrough(argv)`:
    - `_find_workspace()` → walk cwd upward for `.saturn/compose.yaml`.
-   - `_translate_compose(compose_yaml, project)` → `.saturn/compose.json`.
+   - `_find_overrides(ws)` → the `.saturn/compose.override*.yaml` glob + `SATURN_COMPOSE_OVERRIDES` env var.
+   - `_translate_compose([base, *overrides], project)` → `.saturn/compose.json` (the merged, translated spec).
    - `subprocess.run(["docker", "compose", "-f", compose_json, "-p", project, *argv])`.
    - On non-zero exit, print the full command that was run before propagating the exit code.
 

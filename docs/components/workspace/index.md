@@ -41,8 +41,8 @@ Walks cwd upward until it finds a directory containing `.saturn/compose.yaml`. E
 services:
   dev:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: .saturn/Dockerfile
     image: localhost/saturn-<name>:latest
     container_name: saturn_<name>
     init: true
@@ -56,9 +56,20 @@ services:
       # (plus one line per selected flag)
 ```
 
-- `build.context: .` means the `.saturn/` dir is the build context. Small, fast, and `COPY` works on anything you drop into `.saturn/`.
-- `..:/root/<name>` — the workspace root (parent of `.saturn/`) is bind-mounted at `/root/<name>`. Compose resolves `..` relative to the compose file's dir, so this works regardless of cwd.
+- `build.context: ..` points at the project root (parent of `.saturn/`), not `.saturn/` itself. `COPY pyproject.toml /tmp/` in the Dockerfile reaches a project-root file as expected. `dockerfile: .saturn/Dockerfile` is path-relative to the new context. See [decision 0015](../../decisions/0015-build-context-project-root.md) for why this differs from docker's built-in defaults. Trade-off: the build context streams the entire project tree; large trees benefit from a project-root `.dockerignore`.
+- `..:/root/<name>` — the workspace root is bind-mounted at `/root/<name>`. Compose resolves `..` relative to the compose file's dir, so this works regardless of cwd.
 - `${HOME}` and `${SATURN_SOCK}` are compose env substitutions, done at `compose config` time. On host, they expand to the user's home and the real host socket; in guest mode, they expand to `/root` and `/var/run/docker.sock` (inside paths) — which are then reverse-looked-up to host paths. **One compose.yaml, both modes.**
+
+### Overrides alongside the base
+
+Saturn's pass-through layers additional compose files onto `.saturn/compose.yaml` via `docker compose -f base -f override …` — compose's native merge. See [decision 0014](../../decisions/0014-compose-override-chain.md).
+
+Two discovery sources, applied in this order after the base:
+
+1. **`.saturn/compose.override*.yaml`** — globbed and sorted lexically. Ergonomic path for humans: commit a `.saturn/compose.override.yaml` for team-shared tweaks, or drop a gitignored `.saturn/compose.override.local.yaml` for per-machine ones (extra bind mounts, resource limits, alternate port mappings).
+2. **`SATURN_COMPOSE_OVERRIDES`** — colon-separated absolute paths, analogous to docker compose's `COMPOSE_FILE`. Programmatic callers (e.g. galaxy-mini's millworker writing a per-session delta) use this instead of colliding on a well-known filename in a shared workspace dir.
+
+The merge happens inside `docker compose config`, so env substitution and (in guest mode) reverse mount lookup apply to bind sources declared in overrides exactly as they apply to the base. An override declaring `- ${HOME}/.aws:/root/.aws` in a nested guest environment resolves the inside path via reverse lookup, same as any base volume.
 
 Users can edit `Dockerfile` and `compose.yaml` freely after seeding. Add services, networks, volumes, extra bind mounts, anything compose supports.
 

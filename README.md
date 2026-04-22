@@ -102,6 +102,15 @@ Semantics:
 - `saturn base {default,build}` runs `docker rmi` on the existing tag, then rebuilds. The tag can be overridden with `SATURN_BASE_IMAGE`.
 - Pass-through covers the full compose surface: `up`, `up -d`, `down`, `exec dev <cmd>`, `logs -f`, `ps`, `restart dev`, `build`, and so on. The translated spec is written to `.saturn/compose.json` each invocation.
 
+### Compose override chain
+
+Pass-through layers additional compose files onto the committed base via `docker compose -f base -f override …` — compose's native merge (scalars replace, lists append, maps deep-merge). Two sources are picked up automatically and applied in this order, after `.saturn/compose.yaml`:
+
+1. `.saturn/compose.override*.yaml` in the workspace — globbed and sorted lexically. Good for a gitignored `.saturn/compose.override.local.yaml` with per-machine tweaks (extra mounts, resource limits, port mappings).
+2. `SATURN_COMPOSE_OVERRIDES` — colon-separated absolute paths, analogous to docker compose's `COMPOSE_FILE`. The programmatic path for tools layering per-session deltas.
+
+Overrides participate in env substitution and (in guest mode) reverse mount lookup just like the base, because the merge happens inside `docker compose config`. See [decision 0014](docs/decisions/0014-compose-override-chain.md).
+
 ### `saturn new` flags
 
 If none of `--ssh`/`--gh`/`--claude`/`--codex` is passed, `saturn new` defaults to `--ssh --gh --claude`. `--socket` is independent.
@@ -245,8 +254,8 @@ Always use `docker` instead of `podman`. `DOCKER_BUILDKIT=0` is required because
 services:
   dev:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: .saturn/Dockerfile
     image: localhost/saturn-<name>:latest
     container_name: saturn_<name>
     init: true
@@ -259,6 +268,8 @@ services:
       - ..:/root/<name>
       # plus one line per --<flag>
 ```
+
+`build.context: ..` is the project root (parent of `.saturn/`), not `.saturn/` itself — so `COPY pyproject.toml` in the Dockerfile reaches project files as expected. `dockerfile: .saturn/Dockerfile` is path-relative to the new context. See [decision 0015](docs/decisions/0015-build-context-project-root.md) for the rationale.
 
 `${HOME}` and `${SATURN_SOCK}` are compose env substitutions. On host, they resolve to the user's real home and host socket; in guest, they resolve to `/root` and `/var/run/docker.sock` (inside paths), which are then reverse-looked-up by saturn. **One compose.yaml, both modes.**
 
