@@ -31,10 +31,11 @@ Entry point when invoked as `saturn`.
 
 | Command | Handler | Semantics |
 |---|---|---|
-| `new [dir] [--ssh] [--gh] [--claude] [--codex] [--socket]` | `cmd_new` | `mkdir -p <dir>` (default cwd), then `mkdir -p <dir>/.saturn` and seed `Dockerfile` + `compose.yaml`. Host-mode auto-create for each selected flag's bind source. No engine calls. |
+| `new [dir] [--ssh] [--gh] [--claude] [--codex] [--nesting]` | `cmd_new` | `mkdir -p <dir>` (default cwd), then `mkdir -p <dir>/.saturn` and seed `Dockerfile` + `compose.yaml`. Host-mode auto-create for each selected flag's bind source. No engine calls. |
 | `base default` | `cmd_base_default` | Force-rebuild `localhost/saturn-base:latest` from the inlined minimal Dockerfile. |
 | `base build <file>` | `cmd_base_build` | Force-rebuild the base from a user-supplied Dockerfile. Error if the file is missing. |
 | `shell` | alias | Rewrites argv to `exec dev bash` → pass-through. |
+| `host-addr` | `cmd_host_addr` | Print `localhost` (host mode) or `host.docker.internal` (guest mode) — the address to reach the host from the current context. |
 
 **Pass-through** (anything not listed above):
 
@@ -62,7 +63,8 @@ The workspace is discovered by walking cwd upward for `.saturn/compose.yaml`; th
 1. `main()` inspects `sys.argv[1]`.
 2. For `new` and `base`, argparse parses argument-specific flags (no REMAINDER hacks — the pass-through path covers anything with a free-form argv).
 3. For `shell`, argv is rewritten and falls through.
-4. Pass-through calls `passthrough(argv)`:
+4. For `host-addr`, prints the host address and returns (no engine calls).
+5. Pass-through calls `passthrough(argv)`:
    - `_find_workspace()` → walk cwd upward for `.saturn/compose.yaml`.
    - `_find_overrides(ws)` → the `.saturn/compose.override*.yaml` glob + `SATURN_COMPOSE_OVERRIDES` env var.
    - `_translate_compose([base, *overrides], project)` → `.saturn/compose.json` (the merged, translated spec).

@@ -23,7 +23,17 @@ Host mode runs the same pipeline but skips translation — the inside and host p
 | `SATURN_SOCK` | `$SATURN_SOCK` or computed | Socket path visible to *this* saturn process. Host: first of `$XDG_RUNTIME_DIR/{podman/podman.sock,docker.sock}` or `/var/run/docker.sock`. Guest: `/var/run/docker.sock` (the outer saturn bind-mounts the real host socket here). Always re-exported so `${SATURN_SOCK}` substitutes inside `compose.yaml` at `compose config` time. |
 | `BASE_IMAGE` | `$SATURN_BASE_IMAGE` | Base image tag. Default `localhost/saturn-base:latest`. |
 
-At import: `os.environ["DOCKER_HOST"] = f"unix://{SATURN_SOCK}"`. `DOCKER_BUILDKIT` defaults to `0` (rootless podman's docker-compat socket doesn't serve BuildKit; harmless on Docker).
+At import: `os.environ["DOCKER_HOST"] = f"unix://{SATURN_SOCK}"`. `DOCKER_BUILDKIT` is set adaptively by a pair of engine probes:
+
+1. `_detect_cli()` parses `docker --version` to tell docker-cli from a podman shim (e.g. the `podman-docker` package's `/usr/bin/docker`).
+2. `_detect_backend()` runs plain `docker version` through the socket and tests for the substring `"Podman Engine"` in stdout (more robust than `--format '{{json .Server.Components}}'` — the JSON template form fails under podman's own CLI). Also returns whether the socket is root-owned (prior rootful-engine warning, consolidated).
+
+From those:
+
+- **Check A (fail-fast).** `cli == "podman"` with `backend != "podman"` → `sys.exit`. Podman CLI (incl. `--remote`) only speaks podman's native REST API; against a dockerd socket it would fail later with an opaque `ping response was 404`.
+- **Check B (adaptive buildkit).** `cli == "docker"` with `backend == "docker"` and the socket not root-owned on host → `os.environ.pop("DOCKER_BUILDKIT")` so docker's default (BuildKit) takes over. Every other combination `setdefault`s `"0"` (classic builder), because podman's docker-compat socket doesn't serve the BuildKit API. The rootful gate only applies on host — inside a guest, rootless-userns mapping shows the socket as root-owned even against a rootless backend.
+
+Opt out with `SATURN_SKIP_ENGINE_PROBE=1`, which skips both probes and keeps `DOCKER_BUILDKIT=0`.
 
 ### `_run(*args, check=True, capture=False) -> subprocess.CompletedProcess`
 
@@ -126,4 +136,4 @@ No compose.json is written; the second `docker compose` never runs.
 - **`hostname:` in compose.yaml breaks self-inspect.** Saturn reads the container's hostname via `socket.gethostname()`; docker/compose set that to the short container id by default. Overriding `hostname:` makes inspect-by-hostname fail — saturn exits with a labelled message.
 - **Pre-building in guest requires `image:` to be set.** `docker compose config` auto-fills `image: <project>_<service>` when the user doesn't specify one, so this is normally fine. A service with only `build:` and no explicit `image:` would crash saturn — but compose config's normalization prevents that in practice.
 - **Build cache is per-engine.** In guest mode, `docker build` runs against the host engine (via the socket) — the same engine compose will use. Cache hits work normally.
-- **Classic builder forced.** `DOCKER_BUILDKIT=0` at import. Harmless on Docker (where BuildKit falls back to classic); mandatory on podman's docker-compat socket.
+- **Builder selection is adaptive.** `DOCKER_BUILDKIT` is set `"0"` (classic) when the backend probe says podman or when the CLI is podman; unset (docker default, BuildKit on) when both CLI and backend are docker and the host socket is user-owned. Podman's docker-compat socket doesn't serve the BuildKit API, so forcing classic there is mandatory; rootless Docker serves BuildKit fine, so suppressing it was pure regression. See [decision 0016](../../decisions/0016-adaptive-buildkit-and-cli-backend-checks.md).

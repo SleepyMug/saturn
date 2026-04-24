@@ -10,7 +10,7 @@ container paths to their real host backing paths via `docker inspect` on
 the current container.
 
 Commands:
-  new [dir]  [--ssh] [--gh] [--claude] [--codex] [--socket]
+  new [dir]  [--ssh] [--gh] [--claude] [--codex] [--nesting]
                   create <dir>/.saturn/{Dockerfile,compose.yaml}.
                   flags append install blocks + bind mounts.
                   if none of --ssh/--gh/--claude/--codex is passed,
@@ -82,21 +82,103 @@ os.environ["DOCKER_HOST"] = f"unix://{SATURN_SOCK}"
 # userns remap), which breaks that assumption — files flip to root:root
 # on host and the socket hands container-root full host-root. See
 # docs/boundaries/engine-socket.md ("Rootless is load-bearing").
-if IS_HOST and os.getuid() != 0:
+def _detect_cli() -> str:
+    """Identify the `docker` binary on $PATH: real docker-cli vs podman shim.
+
+    Returns "docker", "podman", or "unknown". The `podman-docker` package
+    installs a `/usr/bin/docker` that execs podman, so `docker --version`
+    reports the real banner. Cannot distinguish local podman from
+    `podman --remote` — the banners are byte-identical; mismatches surface
+    via the backend probe instead.
+    """
     try:
-        if Path(SATURN_SOCK).stat().st_uid == 0:
-            print(
-                f"saturn: warning: {SATURN_SOCK} is root-owned (rootful engine). "
-                f"Files written from inside will land as root on host; the socket "
-                f"grants container-root host-root. See docs/boundaries/engine-socket.md.",
-                file=sys.stderr,
-            )
+        r = subprocess.run(
+            ["docker", "--version"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=2, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    if r.returncode != 0:
+        return "unknown"
+    s = r.stdout.lower()
+    if "docker version" in s:
+        return "docker"
+    if "podman" in s:
+        return "podman"
+    return "unknown"
+
+
+def _detect_backend() -> tuple[str, bool]:
+    """Identify the engine behind $SATURN_SOCK + whether the socket is root-owned.
+
+    Probes via plain `docker version` (no `--format`; JSON-template form
+    fails under podman's own CLI because podman's version struct lacks
+    `.Components`). Substring `"Podman Engine"` in stdout → podman;
+    clean exit without that string → docker; any failure → unknown.
+
+    Also prints the rootful-engine advisory on host when the socket is
+    root-owned — consolidated from the previous inline check.
+    """
+    root_owned = False
+    try:
+        root_owned = Path(SATURN_SOCK).stat().st_uid == 0
     except OSError:
         pass
+    if IS_HOST and root_owned and os.getuid() != 0:
+        print(
+            f"saturn: warning: {SATURN_SOCK} is root-owned (rootful engine). "
+            f"Files written from inside will land as root on host; the socket "
+            f"grants container-root host-root. See docs/boundaries/engine-socket.md.",
+            file=sys.stderr,
+        )
+    try:
+        r = subprocess.run(
+            ["docker", "version"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=2, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown", root_owned
+    if r.returncode != 0:
+        return "unknown", root_owned
+    if "Podman Engine" in r.stdout:
+        return "podman", root_owned
+    return "docker", root_owned
 
-# Podman's docker-compat socket doesn't serve BuildKit; force classic
-# builder. For rootless Docker (buildkit-capable), this is harmless.
-os.environ.setdefault("DOCKER_BUILDKIT", "0")
+
+if os.environ.get("SATURN_SKIP_ENGINE_PROBE") != "1":
+    _cli = _detect_cli()
+    _backend, _root_owned = _detect_backend()
+
+    # Check A: podman CLI (incl. --remote) only speaks podman's native
+    # REST API. Against a dockerd socket, the probe itself fails with
+    # `ping response was 404` (returncode ≠ 0 → backend="unknown").
+    # Healthy podman CLI + podman backend would return backend="podman".
+    # So any non-"podman" result under CLI=podman is a mismatch — fail
+    # fast with a crisper error than whatever compose would eventually
+    # surface.
+    if _cli == "podman" and _backend != "podman":
+        sys.exit(
+            f"saturn: podman CLI cannot talk to the engine at "
+            f"{SATURN_SOCK} (expected podman backend, probe returned "
+            f"{_backend!r}). Point $SATURN_SOCK at a podman socket, or "
+            f"install docker-cli."
+        )
+
+    # Check B: docker CLI + docker backend → let docker default win
+    # (BuildKit on). The rootful gate only applies on host — inside a
+    # guest, rootless-userns mapping makes the socket look root-owned
+    # from Python's view even against a rootless backend, so trust the
+    # backend probe there. Podman backend (or unknown) keeps the
+    # classic-builder default because podman's docker-compat socket
+    # doesn't serve the BuildKit API.
+    if _cli == "docker" and _backend == "docker" and not (IS_HOST and _root_owned):
+        os.environ.pop("DOCKER_BUILDKIT", None)
+    else:
+        os.environ.setdefault("DOCKER_BUILDKIT", "0")
+else:
+    os.environ.setdefault("DOCKER_BUILDKIT", "0")
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -167,7 +249,7 @@ services:
 """
 
 _COMPOSE_VOLUMES = {
-    "socket": "      - ${SATURN_SOCK}:/var/run/docker.sock\n",
+    "nesting": "      - ${SATURN_SOCK}:/var/run/docker.sock\n",
     "ssh":    "      - ${HOME}/.ssh:/root/.ssh\n",
     "gh":     "      - ${HOME}/.config/gh:/root/.config/gh\n",
     "claude": (
@@ -187,7 +269,7 @@ _AUTOCREATE = {
     "codex":  [(".codex", "dir")],
 }
 
-_FLAGS = ("ssh", "gh", "claude", "codex", "socket")
+_FLAGS = ("ssh", "gh", "claude", "codex", "nesting")
 
 
 # ---------- engine helpers ----------------------------------------------
@@ -241,7 +323,7 @@ def cmd_new(args: argparse.Namespace) -> None:
     name = _normalize_name(target.name)
 
     # If the user didn't pick any of the mixin-style flags, seed the
-    # common defaults (ssh + gh + claude). --socket is orthogonal and
+    # common defaults (ssh + gh + claude). --nesting is orthogonal and
     # does not count as "specifying a mixin" for this check.
     if not (args.ssh or args.gh or args.claude or args.codex):
         args.ssh = args.gh = args.claude = True
@@ -268,8 +350,9 @@ def cmd_new(args: argparse.Namespace) -> None:
     cf = saturn_dir / "compose.yaml"
     if not cf.exists():
         buf = _COMPOSE_HEAD.format(name=name)
-        if args.socket:
-            buf += _COMPOSE_VOLUMES["socket"]
+        if args.nesting:
+            buf += '    extra_hosts:\n      - "host.docker.internal:host-gateway"\n'
+            buf += _COMPOSE_VOLUMES["nesting"]
         if args.ssh:
             buf += _COMPOSE_VOLUMES["ssh"]
         if args.gh:
@@ -328,6 +411,11 @@ def cmd_base_build(args: argparse.Namespace) -> None:
     print(f"building base image: {BASE_IMAGE} from {path}")
     _build_base(path.read_text())
     print(f"base ready: {BASE_IMAGE}")
+
+
+def cmd_host_addr() -> None:
+    """Print the address to reach the host from the current context."""
+    print("localhost" if IS_HOST else "host.docker.internal")
 
 
 # ---------- translate + pass-through ------------------------------------
@@ -548,6 +636,10 @@ def main() -> None:
 
     if argv[0] == "shell":
         argv = ["exec", "dev", "bash"]
+
+    if argv[0] == "host-addr":
+        cmd_host_addr()
+        return
 
     if argv[0] == "up" and not any(a in ("-d", "--detach", "-h", "--help") for a in argv[1:]):
         print(

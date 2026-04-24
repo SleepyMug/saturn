@@ -4,7 +4,7 @@
 
 Single-file Python wrapper over `docker compose` for rootless podman / rootless Docker. A **workspace** is any directory with a `.saturn/compose.yaml` in it. Saturn passes the compose spec through a small translation step and forwards to `docker compose` — so `saturn up`, `saturn down`, `saturn shell`, `saturn logs -f`, `saturn ps` all just work. The translation step pre-resolves env vars + paths and, inside a saturn container, rewrites bind-mount sources from inside paths to the real host paths by inspecting the current container through the host engine socket.
 
-The container runs as root; rootless userns maps that to your host user, so files written from inside land on disk with host-user ownership. Works at any nesting level (pass `--socket` to `saturn new` on the outer workspace — see flags below).
+The container runs as root; rootless userns maps that to your host user, so files written from inside land on disk with host-user ownership. Works at any nesting level (pass `--nesting` to `saturn new` on the outer workspace — see flags below).
 
 ## What it solves
 
@@ -42,7 +42,7 @@ The detailed spec — image requirements, the exact bind-mount list, env var sem
 saturn base default
 
 # create a workspace
-saturn new ~/code/myproj --ssh --claude --socket   # seeds templates; auto-creates ~/.ssh, ~/.claude, ~/.claude.json
+saturn new ~/code/myproj --ssh --claude --nesting   # seeds templates; auto-creates ~/.ssh, ~/.claude, ~/.claude.json
 $EDITOR ~/code/myproj/.saturn/Dockerfile           # optional: add more tooling
 cd ~/code/myproj && saturn up -d                   # build workspace image + start container
 
@@ -63,12 +63,12 @@ docker ps --filter name=saturn_
 
 ### Nested
 
-With `--socket` on the outer workspace, `saturn` inside can launch a sibling for any subdirectory of the current workspace:
+With `--nesting` on the outer workspace, `saturn` inside can launch a sibling for any subdirectory of the current workspace:
 
 ```sh
 # inside ~/code/myproj's container (cwd = /root/myproj):
 mkdir sub
-saturn new sub --ssh --socket
+saturn new sub --ssh --nesting
 cd sub
 saturn up -d           # saturn_sub runs on the host engine
 ```
@@ -94,6 +94,7 @@ under an existing mount — workspace, socket, or another mounted path.)
 | `saturn base default` | Rebuild `localhost/saturn-base:latest` from the inlined minimal Dockerfile. |
 | `saturn base build <file>` | Rebuild the base from a user-supplied Dockerfile. |
 | `saturn shell` | Alias for `saturn exec dev bash`. |
+| `saturn host-addr` | Print `localhost` (host mode) or `host.docker.internal` (guest mode) — the address to reach the host from the current context. |
 | `saturn <anything else>` | Forwarded to `docker compose -f .saturn/compose.json -p <workspace> <args>`. |
 
 Semantics:
@@ -113,15 +114,15 @@ Overrides participate in env substitution and (in guest mode) reverse mount look
 
 ### `saturn new` flags
 
-If none of `--ssh`/`--gh`/`--claude`/`--codex` is passed, `saturn new` defaults to `--ssh --gh --claude`. `--socket` is independent.
+If none of `--ssh`/`--gh`/`--claude`/`--codex` is passed, `saturn new` defaults to `--ssh --gh --claude`. `--nesting` is independent.
 
-| Flag | Adds to `Dockerfile` | Adds to `compose.yaml` volumes |
+| Flag | Adds to `Dockerfile` | Adds to `compose.yaml` |
 |---|---|---|
 | `--ssh` | `apt install openssh-client` | `${HOME}/.ssh:/root/.ssh` |
 | `--gh` | `apt install gh` | `${HOME}/.config/gh:/root/.config/gh` |
 | `--claude` | `curl -fsSL https://claude.ai/install.sh \| bash` | `${HOME}/.claude:/root/.claude` + `${HOME}/.claude.json:/root/.claude.json` |
 | `--codex` | `apt install nodejs npm` + `npm i -g @openai/codex` | `${HOME}/.codex:/root/.codex` |
-| `--socket` | (none) | `${SATURN_SOCK}:/var/run/docker.sock` — required if you want nested `saturn` or plain `docker` to work inside the container |
+| `--nesting` | (none) | `extra_hosts: ["host.docker.internal:host-gateway"]` + `${SATURN_SOCK}:/var/run/docker.sock` — required if you want nested `saturn` or plain `docker` to work inside the container, and to reach host services via `host.docker.internal` |
 
 ### Files written
 
@@ -151,7 +152,7 @@ Container: `saturn_<basename>`. Image: `localhost/saturn-<basename>:latest`. Com
 - **`docker` CLI with `compose` plugin** on `$PATH`. Saturn shells out to `docker compose` for parsing and execution; there is no fallback parser.
 - **A Unix socket** at `$SATURN_SOCK`. Auto-picked at import: first of `$XDG_RUNTIME_DIR/podman/podman.sock`, `$XDG_RUNTIME_DIR/docker.sock`, `/var/run/docker.sock` that exists. Exported back as `DOCKER_HOST=unix://$SATURN_SOCK`.
 - **`docker inspect $(hostname)` returns a `.Mounts` list** (guest mode only). Reverse-lookup depends on the container's hostname matching what the engine knows; `socket.gethostname()` is what saturn asks for.
-- **Classic builder**. Saturn sets `DOCKER_BUILDKIT=0` at import because podman's docker-compat socket doesn't serve the BuildKit API. Harmless on Docker (falls back to classic).
+- **Adaptive builder selection.** At import, saturn probes the `docker` binary (`docker --version` — catches podman shims) and the engine (`docker version` stdout contains `"Podman Engine"` iff backend is podman). Podman CLI against a non-podman engine fails fast with a clear message. Docker CLI against rootless Docker → `DOCKER_BUILDKIT` is unset (docker's default: BuildKit on). Any other combination keeps `DOCKER_BUILDKIT=0` (classic builder — mandatory against podman's docker-compat socket). Skip both probes with `SATURN_SKIP_ENGINE_PROBE=1`.
 
 ### Host environment variables
 
@@ -307,4 +308,4 @@ saturn up -d
 
 ### Security note
 
-Saturn bind-mounts whatever your workspace `compose.yaml` declares. With `saturn new --socket` the list is: host engine socket (full engine control), workspace dir, plus any credential paths from `--ssh/--gh/--claude/--codex`. This is a meaningful blast radius; acceptable for a personal dev tool, not for untrusted code. `IS_SANDBOX=1` is a tool-level affirmation that root is intentional, not an actual sandbox.
+Saturn bind-mounts whatever your workspace `compose.yaml` declares. With `saturn new --nesting` the list is: host engine socket (full engine control), `extra_hosts` for host-gateway DNS, workspace dir, plus any credential paths from `--ssh/--gh/--claude/--codex`. This is a meaningful blast radius; acceptable for a personal dev tool, not for untrusted code. `IS_SANDBOX=1` is a tool-level affirmation that root is intentional, not an actual sandbox.

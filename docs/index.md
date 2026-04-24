@@ -19,6 +19,6 @@ Implementation: one Python file, stdlib only. Hard dep on the `docker` CLI with 
 - [components/engine/](components/engine/index.md) — The translation pipeline: `docker compose config --format json`, `_current_container_mounts`, `_translate`, `_translate_compose`, `passthrough`.
 - [boundaries/engine-socket.md](boundaries/engine-socket.md) — Bind-mounted `/var/run/docker.sock`: container-root ↔ host-user under rootless userns.
 - [boundaries/nested-env.md](boundaries/nested-env.md) — Two-var contract (`SATURN_IN_GUEST`, `SATURN_SOCK`). Everything else saturn needs for nesting is derived by engine inspect.
-- [decisions/](decisions/) — numbered, append-only design decisions
+- [decisions/](decisions/) — numbered, append-only design decisions (0001–0017)
 - [plans/](plans/) — pending work
 - [experiment_journal/](experiment_journal/) — findings about external-world behavior

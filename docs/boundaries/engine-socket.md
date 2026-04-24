@@ -20,8 +20,8 @@ Saturn itself uses the socket for three things: (a) talking to the host engine v
 
 - The socket appears at `/var/run/docker.sock` (saturn convention; `DOCKER_HOST=unix://...` points here).
 - Container process runs as container-uid 0 (root).
-- Under **rootless** engines: host uid 1000 → container uid 0. The socket and the container process are the same principal — `open()` succeeds.
-- Under **rootful** engines: no userns remapping. Container uid 0 = host uid 0 = socket owner (root) — `open()` still succeeds.
+- Under **rootless** engines: host uid 1000 → container uid 0. The socket and the container process are the same principal — `open()` succeeds, and files written into bind-mounted host trees land as the invoking host user.
+- Under **rootful** engines: no userns remapping. Container uid 0 = host uid 0, so `open()` on the socket still succeeds — but every file the container writes into a bind-mounted host tree (workspace source, `~/.ssh`, `~/.claude`, ...) lands as `root:root` on host. Saturn's other invariants assume the rootless mapping; see "Rootless is load-bearing" below before pointing `SATURN_SOCK` at a rootful daemon.
 
 ## Data representation at the boundary
 
@@ -50,3 +50,12 @@ Unix domain socket carrying the Docker Engine HTTP API (used by both docker and 
 Bind-mounting this socket grants full control of your engine to the container — privileged sibling with `/` mounted is possible. Saturn additionally bind-mounts whatever the workspace's `compose.yaml` declares — typically the workspace dir at `/root/<basename>`, plus any mixin-style bind mounts `saturn new --ssh/--claude/...` generated (e.g. `${HOME}/.ssh:/root/.ssh`). The blast radius is whatever that compose file lists. This is acceptable for a personal dev tool, not acceptable for untrusted code.
 
 `IS_SANDBOX=1` in the base image tells tools like Claude Code that running as root is intentional — it is not an actual sandbox.
+
+## Rootless is load-bearing
+
+The rootless userns mapping (container-uid 0 → host user) is the reason saturn can run as root inside without poisoning the host. Two things fall out of that assumption that do not survive pointing at a rootful daemon:
+
+- **File ownership cascade.** Under rootful, any file the container writes into a bind-mounted host tree is owned by `root:root` on host. This is not limited to the mount points — atomic-save editors (vim, most IDEs) `rename()` new inodes into place, so just editing a workspace file from inside flips its host owner to root. `git` writes root-owned blobs under `.git/objects/`. Config-dir mixins are worse: `~/.ssh`, `~/.config/gh`, `~/.claude`, `~/.claude.json`, `~/.codex` will accumulate root-owned files that the host user can no longer rewrite. `ssh` in particular enforces strict ownership on `~/.ssh/` and its keys — one root-owned append to `known_hosts` from inside a rootful container breaks host-side ssh until you `chown` it back.
+- **Threat-model collapse.** A bind-mounted socket is always "root on the engine" — but under rootless that engine's blast radius is capped at your host user. Under rootful it is the host machine: container-root can `docker run --privileged -v /:/host ...` and escalate. Anything untrusted inside the container (a compromised dep, an LLM session, a CI task) inherits that capability.
+
+Saturn prints a one-line warning to stderr on startup when it detects the chosen socket is owned by uid 0 and the caller is not root — e.g. when `SATURN_SOCK=/var/run/docker.sock` is the only available socket, or the user set it explicitly. The warning is advisory, not a gate. If you genuinely need to run saturn against a rootful daemon, the supported escape hatch is Docker's `userns-remap` (maps rootful container-root to a subuid range, restoring the rootless ownership story at the daemon-config level).
