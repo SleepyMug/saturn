@@ -1,0 +1,19 @@
+services:
+  dev:
+    build:
+      context: ..
+      dockerfile: .saturn/Dockerfile
+    image: localhost/saturn-saturn:latest
+    container_name: saturn_saturn
+    init: true
+    working_dir: /root/saturn
+    command: ["sleep", "infinity"]
+    environment:
+      SATURN_IN_GUEST: "1"
+      SATURN_SOCK: /var/run/docker.sock
+      IS_SANDBOX: "1"
+    volumes:
+      - ..:/root/saturn
+      - ${HOME}/.claude:/root/.claude
+      - ${HOME}/.claude.json:/root/.claude.json
+      - ${HOME}/.config/gh:/root/.config/gh
