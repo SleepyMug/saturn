@@ -8,16 +8,20 @@ There is no global registry of workspaces. A directory *becomes* a workspace the
 
 The workspace's **basename** (the dir's final path component) drives container and image identity: `saturn_<basename>`, `localhost/saturn-<basename>:latest`, container cwd `/root/<basename>`. Compose project name is also set to the basename (via `-p <basename>` on every invocation) so compose's default naming (from the compose file's dir = `.saturn`) doesn't collide across workspaces.
 
-The basename is **normalized** before embedding. Docker image refs, container names, and compose project names share a tight regex (the strictest is compose's `^[a-z0-9][a-z0-9_-]*$`); `_normalize_name` lowercases, replaces any char not in `[a-z0-9_-]` with `-`, collapses consecutive `-`, and trims leading/trailing `-_`. A workspace at `/home/user/MyProj` becomes `myproj` for identity; the directory on disk keeps its original name. A note is printed when normalization actually changes anything so the disk/identity split is visible.
+The basename is **normalized** before embedding. Docker image refs, container names, and compose project names share a tight regex (the strictest is compose's `^[a-z0-9][a-z0-9_-]*$`); `normalize_name` lowercases, replaces any char not in `[a-z0-9_-]` with `-`, collapses consecutive `-`, and trims leading/trailing `-_`. A workspace at `/home/user/MyProj` becomes `myproj` for identity; the directory on disk keeps its original name. A note is printed when normalization actually changes anything so the disk/identity split is visible.
 
 ## Provided APIs
+
+### `normalize_name(raw: str) -> str`
+
+Lowercase + replace invalid chars with `-`, collapse runs, trim ends. Exits if the result is empty or doesn't start with `[a-z0-9]`. Prints a `note:` line when normalization actually changes anything — the disk dir keeps its original name; only the embedded image/container/project identity uses the normalized form.
 
 ### `cmd_new(args) -> None`
 
 Seeds `<target>/.saturn/{Dockerfile,compose.yaml}` from templates.
 
 1. Resolve `target` (cwd default). `mkdir -p` if missing.
-2. Validate the dir has a non-empty basename not starting with `.`; run `_normalize_name(target.name)` to get the compose-safe identity.
+2. Validate the dir has a non-empty basename not starting with `.`; run `normalize_name(target.name)` to get the compose-safe identity.
 3. `mkdir -p <target>/.saturn`; write `Dockerfile` and `compose.yaml` if absent (never overwrites).
 4. Host mode only: for each flag, auto-create the host-side source path if missing (`mkdir -p` for dirs, `touch` for files) so the first `up` doesn't fail the bind mount. Guest mode skips auto-create.
 
@@ -31,7 +35,7 @@ Flags are independently opt-in. If none of `--ssh`/`--gh`/`--claude`/`--codex` i
 | `--codex` | `RUN apt-get install nodejs npm && npm i -g @openai/codex` | `- ${HOME}/.codex:/root/.codex` | `~/.codex` (dir) |
 | `--nesting` | (none) | `extra_hosts: ["host.docker.internal:host-gateway"]` + `${SATURN_SOCK}:/var/run/docker.sock` | — |
 
-### `_find_workspace() -> Path`
+### `find_workspace() -> Path`
 
 Walks cwd upward until it finds a directory containing `.saturn/compose.yaml`. Exits with a suggestion to run `saturn new` if nothing is found by the filesystem root. This is the lone mechanism that associates a command with a workspace — there are no positional target args on lifecycle commands (`up`, `down`, `shell`, `exec`, etc.). `cd` to switch workspaces.
 

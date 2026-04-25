@@ -2,7 +2,7 @@
 
 ## What it is
 
-Single-file Python wrapper over `docker compose` for rootless podman / rootless Docker. A **workspace** is any directory with a `.saturn/compose.yaml` in it. Saturn passes the compose spec through a small translation step and forwards to `docker compose` — so `saturn up`, `saturn down`, `saturn shell`, `saturn logs -f`, `saturn ps` all just work. The translation step pre-resolves env vars + paths and, inside a saturn container, rewrites bind-mount sources from inside paths to the real host paths by inspecting the current container through the host engine socket.
+Python wrapper over `docker compose` for rootless podman / rootless Docker, distributed as a single-file zipapp (`./saturn`). Source under `src/saturn/` (six small modules); built via `python3 build.py`. A **workspace** is any directory with a `.saturn/compose.yaml` in it. Saturn passes the compose spec through a small translation step and forwards to `docker compose` — so `saturn up`, `saturn down`, `saturn shell`, `saturn logs -f`, `saturn ps` all just work. The translation step pre-resolves env vars + paths and, inside a saturn container, rewrites bind-mount sources from inside paths to the real host paths by inspecting the current container through the host engine socket. A `saturn docker <args>` shim lets callers drive the engine directly with saturn's resolved `DOCKER_HOST`.
 
 The container runs as root; rootless userns maps that to your host user, so files written from inside land on disk with host-user ownership. Works at any nesting level (pass `--nesting` to `saturn new` on the outer workspace — see flags below).
 
@@ -95,6 +95,7 @@ under an existing mount — workspace, socket, or another mounted path.)
 | `saturn base build <file>` | Rebuild the base from a user-supplied Dockerfile. |
 | `saturn shell` | Alias for `saturn exec dev bash`. |
 | `saturn host-addr` | Print `localhost` (host mode) or `host.docker.internal` (guest mode) — the address to reach the host from the current context. |
+| `saturn docker <args>` | Forward `<args>` verbatim to the `docker` CLI on `$PATH`, with saturn's resolved `DOCKER_HOST`/`DOCKER_BUILDKIT` already in effect. Skips compose translation; useful for `saturn docker exec saturn_foo bash`, `saturn docker logs -f saturn_bar`, `saturn docker images`, etc. |
 | `saturn <anything else>` | Forwarded to `docker compose -f .saturn/compose.json -p <workspace> <args>`. |
 
 Semantics:
@@ -102,6 +103,7 @@ Semantics:
 - `saturn new` is idempotent: never overwrites existing `.saturn/Dockerfile` or `compose.yaml`. In host mode, it auto-creates any missing host-side bind-mount sources (e.g. `~/.ssh`, `~/.claude.json`) so the first `saturn up` doesn't fail.
 - `saturn base {default,build}` runs `docker rmi` on the existing tag, then rebuilds. The tag can be overridden with `SATURN_BASE_IMAGE`.
 - Pass-through covers the full compose surface: `up`, `up -d`, `down`, `exec dev <cmd>`, `logs -f`, `ps`, `restart dev`, `build`, and so on. The translated spec is written to `.saturn/compose.json` each invocation.
+- `saturn docker <args>` is the direct-CLI escape hatch — no compose, no translation, no argparse intercept. `saturn docker --help` runs `docker --help`. Use it for engine-level operations on saturn-managed objects (`docker exec saturn_foo …`, `docker inspect …`) or for docker subcommands compose doesn't expose (`docker images`, `docker network ls`, etc.).
 
 ### Compose override chain
 
@@ -223,6 +225,25 @@ saturn new ~/code/myproj                               # workspace Dockerfile FR
 ```
 
 Each `saturn new --<flag>` does two things: appends an install step to the workspace `Dockerfile`, and appends a bind-mount to `compose.yaml`. Prebaking replaces only the first. If your custom base already has (say) `gh` installed, dropping `--gh` from `saturn new` avoids re-running the install, but you must still add `- ${HOME}/.config/gh:/root/.config/gh` to the workspace's `compose.yaml` by hand — otherwise `gh` inside the container will have no auth config. Same pattern for `ssh`, `claude`, `codex`.
+
+### Building from source
+
+Source lives under `src/saturn/` (six modules: `cli`, `env`, `workspace`, `base`, `engine`, `docker`). The repo-root `./saturn` is a `python -m zipapp` build artifact. After editing source, rebuild it:
+
+```sh
+python3 build.py            # writes ./saturn (overwrites)
+python3 build.py -o /tmp/x  # custom output path
+```
+
+`build.py` runs `zipapp.create_archive(source='src', target='saturn', interpreter='/usr/bin/env python3')`. The output is a single executable file with a Python shebang — same install pattern, same `COPY saturn /usr/local/bin/saturn` step in the base image.
+
+Run the unit tests with:
+
+```sh
+python3 -m unittest discover -s tests -t .
+```
+
+Tests are stdlib `unittest`; they stub out `docker` on `$PATH` where they need to and skip the engine probe via `SATURN_SKIP_ENGINE_PROBE=1`. See [decision 0018](docs/decisions/0018-modular-source-zipapp-distribution.md).
 
 ### Avoiding podman storage races
 
