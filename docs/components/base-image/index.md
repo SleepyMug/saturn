@@ -50,10 +50,17 @@ Shared helper for `cmd_base_default` and `cmd_base_build`.
 
 1. `tempfile.TemporaryDirectory(prefix="saturn-base-")` — auto-cleanup.
 2. Write `dockerfile_text` into `<tmp>/Dockerfile`.
-3. `shutil.copy(SCRIPT, <tmp>/saturn)` — always, so `COPY saturn ...` works.
+3. `materialize_script(<tmp>/saturn)` — drops a single-file saturn binary at the path, regardless of how saturn was invoked. (Zipapp: `shutil.copy(sys.argv[0], dst)`. Source: `zipapp.create_archive(src/, dst)`.) The base image's `COPY saturn /usr/local/bin/saturn` step then copies it in.
 4. `docker build -f <tmp>/Dockerfile -t BASE_IMAGE <tmp>`.
 
-`SCRIPT = Path(__file__).resolve()` at module top — copy works from any cwd.
+### `materialize_script(dest: Path) -> None`
+
+Places an executable single-file saturn binary at `dest`.
+
+- **Zipapp invocation** (the normal case — `./saturn base default` from a zipapp on disk): `Path(sys.argv[0]).resolve()` is a real file → `shutil.copy(argv0, dest)` and `chmod 0755`.
+- **Source invocation** (`python -m saturn` from a checkout): `sys.argv[0]` points at `src/saturn/__main__.py`, not a single file. Build a fresh zipapp from `src/` (which contains the top-level `__main__.py` and the `saturn/` package) into `dest` via `zipapp.create_archive(...)`, then `chmod 0755`.
+
+Either way, the next `docker build` step in `_build_base` finds a single executable `saturn` at the build-context root.
 
 ### `cmd_base_default(args) -> None`
 
@@ -66,7 +73,8 @@ Force-rebuild from a user-supplied Dockerfile. Errors if the file is missing. Th
 ## Consumed APIs
 
 - `_run` subprocess wrapper.
-- `SCRIPT` constant.
+- `BASE_IMAGE` from `env`.
+- `sys.argv[0]` and `Path(__file__)` for invocation-form detection inside `materialize_script`.
 
 ## Workflows
 
@@ -113,3 +121,4 @@ Workspaces without any flags get just the `FROM` line — they pick up everythin
 - **No `base template` command.** Previous designs emitted a rendered Containerfile for editing. The new base image doesn't splice anything, so `cat`-ing the inlined string (or the actual file if you want a copy) is equivalent. Use `saturn base build <your-file>` when you want a custom.
 - **COPY ordering matters.** `COPY saturn` must come after the `apt-get install` layer so `chmod 0755` has `/usr/local/bin` available. The inlined Dockerfile enforces this.
 - **Base image doesn't carry tool-specific installs.** SSH client, gh, claude, nodejs+codex all live in per-workspace Dockerfiles now — inserted by `saturn new --ssh`, `--gh`, `--claude`, `--codex`. Re-running `saturn base default` does not re-install any of those; edit the workspace Dockerfile if you want them.
+- **Inside the container, the saturn binary is the same zipapp as on host.** `materialize_script` produces a byte-identical zipapp (or copy of one); nesting works because the saturn at `/usr/local/bin/saturn` inside is the same code that built the image.

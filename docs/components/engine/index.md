@@ -39,9 +39,13 @@ Opt out with `SATURN_SKIP_ENGINE_PROBE=1`, which skips both probes and keeps `DO
 
 Single small wrapper around `subprocess.run` — the only subprocess entry point. `check=True` by default; `capture=True` returns stdout/stderr as text.
 
-### `_find_workspace() -> Path`
+### `find_workspace() -> Path`
 
-Walks cwd upward until a dir contains `.saturn/compose.yaml`. Exits with a `saturn new` hint if it hits `/` with nothing found. See [workspace](../workspace/index.md).
+Lives in `saturn/workspace.py`; `engine.passthrough` imports it. Walks cwd upward until a dir contains `.saturn/compose.yaml`. Exits with a `saturn new` hint if it hits `/` with nothing found. See [workspace](../workspace/index.md).
+
+### `cmd_host_addr() -> None`
+
+Prints `localhost` (host mode) or `host.docker.internal` (guest mode). One line, no engine calls. Lets scripts use `$(saturn host-addr):PORT` without branching on context.
 
 ### `_current_container_mounts() -> list[dict]`
 
@@ -77,12 +81,16 @@ Reverse mount lookup runs on the *merged* bind sources — a bind declared in an
 
 ### `passthrough(argv: list[str]) -> None`
 
-Glue. `_find_workspace()` → `files = [ws/.saturn/compose.yaml, *_find_overrides(ws)]` → `_translate_compose(files, project)` → `subprocess.run(["docker", "compose", "-f", <compose.json>, "-p", <project>, *argv])`. On non-zero exit, prints the full command that was run (to stderr) before `sys.exit`ing with the child's returncode.
+Glue. `find_workspace()` → `files = [ws/.saturn/compose.yaml, *_find_overrides(ws)]` → `_translate_compose(files, project)` → `subprocess.run(["docker", "compose", "-f", <compose.json>, "-p", <project>, *argv])`. On non-zero exit, prints the full command that was run (to stderr) before `sys.exit`ing with the child's returncode.
+
+### `_run(*args, check=True, capture=False) -> subprocess.CompletedProcess`
+
+Single small wrapper around `subprocess.run`. `_run` is for "we're running a docker command and want to surface failures" — it's used by the engine, the base-image build, and the `docker rmi`/`docker build` paths. It is **not** used by `cmd_docker` (the `saturn docker <args>` shim), which forwards stdio verbatim and propagates the child returncode without raising — see [docker.py](../../decisions/0018-modular-source-zipapp-distribution.md).
 
 ## Consumed APIs
 
 - [`cmd_base_default`, `cmd_base_build`, `_build_base`](../base-image/index.md#provided-apis) — when argv is `base ...`.
-- [workspace discovery](../workspace/index.md#provided-apis) — `_find_workspace`.
+- [workspace discovery](../workspace/index.md#provided-apis) — `find_workspace`.
 - External: the `docker` CLI with the `compose` plugin, talking to the socket at `SATURN_SOCK`.
 
 ## Workflows
@@ -94,7 +102,7 @@ cd ~/code/myproj
 saturn up -d
 ```
 
-1. `_find_workspace()` → `/home/guest/code/myproj`; project = `myproj`.
+1. `find_workspace()` → `/home/guest/code/myproj`; project = `myproj`.
 2. `_translate_compose()`:
    - `docker compose -f .saturn/compose.yaml -p myproj config --format json` → spec (all paths absolute, all env substituted).
    - Host mode, no translation. Write `.saturn/compose.json`.
@@ -109,7 +117,7 @@ mkdir sub && saturn new sub --socket
 cd sub && saturn up -d
 ```
 
-1. `_find_workspace()` → `/root/myproj/sub`; project = `sub`.
+1. `find_workspace()` → `/root/myproj/sub`; project = `sub`.
 2. `_translate_compose()`:
    - `docker compose ... config --format json` → spec where, e.g., `services.dev.build.context = /root/myproj/sub/.saturn` and `services.dev.volumes[0].source = /root/myproj/sub`.
    - `_current_container_mounts()` returns the outer container's mounts: `/home/guest/code/myproj:/root/myproj`, `/run/user/1000/podman/podman.sock:/var/run/docker.sock`, etc.
